@@ -293,15 +293,32 @@ const DOM = String.raw`
     const candidates = el.id ? ['#' + CSS.escape(el.id)] : [];
     for (const attr of ['data-testid','aria-label','name','placeholder']) {
       const value = el.getAttribute(attr);
-      if (value) candidates.push(el.tagName.toLowerCase() + '[' + attr + '=' + JSON.stringify(value) + ']');
+      if (value) candidates.push(el.tagName.toLowerCase() + '[' + attr + '="' + CSS.escape(value) + '"]');
     }
     return candidates.find(s => { if (s.length > 180) return false; try { return document.querySelectorAll(s).length === 1; } catch { return false; } });
   };
   const hasVisible = selector => Array.from(document.querySelectorAll(selector)).some(visible);
+  // A widget whose response token is filled has been passed and no longer gates the page.
+  const solved = el => {
+    for (let p = el; p && p !== document.documentElement; p = p.parentElement) {
+      const token = p.querySelector('[name="g-recaptcha-response"],[name="h-captcha-response"],[name="cf-turnstile-response"]');
+      if (token) return !!token.value;
+    }
+    return false;
+  };
+  // Image/puzzle challenges are never automated. Match reCAPTCHA by its bframe path only:
+  // hCaptcha's checkbox frame has "recaptchacompat" in its URL and "challenge" in its title.
+  const puzzle = () => hasVisible('iframe[src*="/recaptcha/"][src*="/bframe"],iframe[src*="hcaptcha"][src*="frame=challenge"]');
+  const pendingWidget = () => Array.from(document.querySelectorAll(
+    // Invisible reCAPTCHA/hCaptcha only show a badge; they are not a gate. Turnstile's iframe is
+    // often inside a closed shadow root, so its light-DOM response input marks the widget.
+    '.g-recaptcha:not([data-size="invisible"]),.h-captcha:not([data-size="invisible"]),.cf-turnstile,' +
+    'iframe[src*="hcaptcha"][src*="frame=checkbox"],iframe[src*="challenges.cloudflare"],input[name="cf-turnstile-response"]'
+  )).some(el => (el.type === 'hidden' ? !!el.parentElement && visible(el.parentElement) : visible(el)) && !solved(el));
   const reasonsFor = () => {
     const reasons = [], url = location.href;
-    const challenge = /\/sorry\/|challenges\.cloudflare\./i.test(url) ||
-      hasVisible('iframe[src*="recaptcha"][title*="challenge"],iframe[src*="hcaptcha"],iframe[src*="challenges.cloudflare"],.g-recaptcha,.h-captcha');
+    const challenge = /\/sorry\/|challenges\.cloudflare\./i.test(url) || typeof window._cf_chl_opt === 'object' ||
+      puzzle() || pendingWidget();
     // Do not treat an ordinary mention of "email address" or "验证码" as a login wall.
     const heading = Array.from(document.querySelectorAll('h1,h2,[role="heading"]')).filter(visible).map(el => visibleText(el, 500)).join(' ');
     if (challenge || /verify you are human|checking your browser|unusual traffic|人机验证/i.test(heading)) reasons.push('CAPTCHA or human verification');
@@ -315,7 +332,7 @@ const DOM = String.raw`
     if (sensitive(el)) throw new Error('Password, OTP and verification fields require manual input in noVNC.');
     if (el && (disabled(el) || el.readOnly)) throw new Error('Element is disabled or read-only.');
     const reasons = reasonsFor();
-    if (reasons.some(r => r !== 'login')) throw new Error('Manual user action required: ' + reasons.join(', ') + '. Use check to open noVNC.');
+    if (reasons.some(r => r !== 'login')) throw new Error('Manual user action required: ' + reasons.join(', ') + '. Use check to retry automatic verification or open noVNC.');
   };
   const probe = () => {
     let watch = store.watch;
@@ -365,6 +382,17 @@ async function snapshot(client: CDPConnection, selector: string | undefined, max
   `), signal);
 }
 
+/** Read-only, so retrying is safe while a navigation replaces the execution context or body. */
+async function inspect(client: CDPConnection, selector: string | undefined, maxChars: number, maxElements: number, signal?: AbortSignal) {
+  for (let attempt = 0; ; attempt++) {
+    try { return await snapshot(client, selector, maxChars, maxElements, signal); }
+    catch (error) {
+      if (attempt >= 4 || !(contextChanged(error) || /Document body is not available/.test(String(error)))) throw error;
+      await sleep(120, signal);
+    }
+  }
+}
+
 /** Poll in the host so navigation cannot strand a page-side promise. No blind sleep. */
 async function waitForPage(client: CDPConnection, options: { selector?: string; text?: string; state?: string; timeoutMs: number; target?: boolean }, signal?: AbortSignal) {
   const until = Date.now() + options.timeoutMs;
@@ -409,17 +437,38 @@ async function click(client: CDPConnection, selector: string, signal?: AbortSign
     throw new Error('Element is covered or outside the viewport; no click was sent. Read the page or dismiss the overlay.');
   `), signal);
   await client.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y }, signal);
+  await pressAt(client, point.x, point.y, signal);
+  return `Clicked ${point.tag}`;
+}
+async function pressAt(client: CDPConnection, x: number, y: number, signal?: AbortSignal, holdMs = 0) {
   let pressed = false;
   try {
     aborted(signal);
     pressed = true; // The event may be delivered even if its acknowledgement is cancelled.
-    await client.send("Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", clickCount: 1 }, signal);
+    await client.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 }, signal);
+    if (holdMs) await sleep(holdMs, signal);
   } finally {
     // Release even after cancellation to avoid leaving a stuck mouse button.
-    if (pressed && client.open) await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", clickCount: 1 }, undefined, 1500);
+    if (pressed && client.open) await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 }, undefined, 1500);
   }
   aborted(signal);
-  return `Clicked ${point.tag}`;
+}
+
+// US-layout virtual key codes. charCodeAt() is wrong for punctuation: "." is 46 (Delete),
+// "'" is 39 (ArrowRight), "%" is 37 (ArrowLeft), etc., which page key handlers would misread.
+const PUNCTUATION: Record<string, [code: string, keyCode: number]> = {
+  "`": ["Backquote", 192], "~": ["Backquote", 192], "-": ["Minus", 189], "_": ["Minus", 189], "=": ["Equal", 187], "+": ["Equal", 187],
+  "[": ["BracketLeft", 219], "{": ["BracketLeft", 219], "]": ["BracketRight", 221], "}": ["BracketRight", 221],
+  "\\": ["Backslash", 220], "|": ["Backslash", 220], ";": ["Semicolon", 186], ":": ["Semicolon", 186], "'": ["Quote", 222], "\"": ["Quote", 222],
+  ",": ["Comma", 188], "<": ["Comma", 188], ".": ["Period", 190], ">": ["Period", 190], "/": ["Slash", 191], "?": ["Slash", 191],
+  "!": ["Digit1", 49], "@": ["Digit2", 50], "#": ["Digit3", 51], "$": ["Digit4", 52], "%": ["Digit5", 53],
+  "^": ["Digit6", 54], "&": ["Digit7", 55], "*": ["Digit8", 56], "(": ["Digit9", 57], ")": ["Digit0", 48],
+};
+function characterKey(key: string) {
+  if (/^[a-z]$/i.test(key)) return { key, code: `Key${key.toUpperCase()}`, keyCode: key.toUpperCase().charCodeAt(0), text: key };
+  if (/^\d$/.test(key)) return { key, code: `Digit${key}`, keyCode: key.charCodeAt(0), text: key };
+  const [code, keyCode] = PUNCTUATION[key] ?? ["", 0];
+  return { key, code, keyCode, text: key };
 }
 
 const KEYS: Record<string, { key: string; code: string; keyCode: number; text?: string }> = {
@@ -440,11 +489,10 @@ function keyDefinition(chord: string) {
     if (!flag) throw new Error(`Unsupported key modifier: ${part}`);
     modifiers |= flag;
   }
-  const definition = KEYS[key] ?? (key.length === 1 ? {
-    key, code: /[a-z]/i.test(key) ? `Key${key.toUpperCase()}` : /\d/.test(key) ? `Digit${key}` : "",
-    keyCode: key.toUpperCase().charCodeAt(0), text: key,
-  } : undefined);
+  let definition = KEYS[key] ?? ([...key].length === 1 ? characterKey(key) : undefined);
   if (!definition) throw new Error(`Unsupported key: ${key}`);
+  // Shift+a should type "A", as on a real keyboard.
+  if (modifiers & 8 && /^[a-z]$/.test(definition.key)) definition = { ...definition, key: definition.key.toUpperCase(), text: definition.key.toUpperCase() };
   return { key: definition.key, code: definition.code, windowsVirtualKeyCode: definition.keyCode,
     nativeVirtualKeyCode: definition.keyCode, modifiers,
     text: modifiers & (1 | 2 | 4) ? undefined : definition.text };
@@ -515,6 +563,172 @@ async function press(client: CDPConnection, selector: string | undefined, key: s
   return `Pressed ${key}`;
 }
 
+async function listTargets(signal?: AbortSignal): Promise<Page[]> {
+  const response = await fetch(`${CDP_URL}/json/list`, { signal: deadlineSignal(3000, signal) });
+  if (!response.ok) throw new Error(`Cannot list Chromium targets: HTTP ${response.status}`);
+  return await response.json() as Page[];
+}
+
+// ---- Automatic human-verification checkbox ----
+// Only the single "I am human" checkbox of these widgets is clicked. Image/puzzle challenges,
+// sliders and other CAPTCHAs are left to the user via noVNC. Set PI_CHROMIUM_AUTO_VERIFY=0 to disable.
+const CAPTCHA = "CAPTCHA or human verification";
+const AUTO_VERIFY = process.env.PI_CHROMIUM_AUTO_VERIFY !== "0";
+const VERIFY_TIMEOUT_MS = 25_000;
+type DomNode = {
+  nodeId: number; backendNodeId: number; nodeName: string; localName?: string; attributes?: string[]; frameId?: string;
+  children?: DomNode[]; shadowRoots?: DomNode[]; contentDocument?: DomNode;
+};
+type Widget = { name: string; frame: RegExp; checkbox: (node: DomNode) => boolean; fallbackX: number };
+const WIDGETS: Widget[] = [
+  { name: "Cloudflare Turnstile", frame: /^https:\/\/challenges\.cloudflare\.com\//,
+    checkbox: node => node.localName === "input" && attr(node, "type") === "checkbox", fallbackX: 30 },
+  { name: "reCAPTCHA", frame: /^https:\/\/(www\.)?(google\.com|recaptcha\.net)\/recaptcha\/(api2|enterprise)\/anchor\?(?!.*size=invisible)/,
+    checkbox: node => attr(node, "id") === "recaptcha-anchor", fallbackX: 27 },
+  { name: "hCaptcha", frame: /^https:\/\/[\w.-]*hcaptcha\.com\/.*#.*frame=checkbox/,
+    checkbox: node => attr(node, "id") === "checkbox", fallbackX: 30 },
+];
+type Spot = { widget: string; x: number; y: number; checked: boolean };
+type Box = { left: number; top: number; width: number; height: number };
+
+function attr(node: DomNode, name: string) {
+  const list = node.attributes ?? [];
+  for (let i = 0; i < list.length; i += 2) if (list[i] === name) return list[i + 1];
+  return undefined;
+}
+/** Light DOM, every shadow root (closed ones too, via pierce) and same-process frame documents. */
+function collect(root: DomNode, match: (node: DomNode) => boolean) {
+  const found: DomNode[] = [], parents = new Map<DomNode, DomNode>(), stack = [root];
+  while (stack.length) {
+    const node = stack.pop()!;
+    if (match(node)) found.push(node);
+    for (const child of [...(node.children ?? []), ...(node.shadowRoots ?? []), ...(node.contentDocument ? [node.contentDocument] : [])]) {
+      parents.set(child, node);
+      stack.push(child);
+    }
+  }
+  return { found, parents };
+}
+async function boxOf(client: CDPConnection, nodeId: number, signal: AbortSignal, quad: "border" | "content" = "border"): Promise<Box | undefined> {
+  try {
+    const { model } = await client.send("DOM.getBoxModel", { nodeId }, signal);
+    const q: number[] = model[quad], xs = [q[0], q[2], q[4], q[6]], ys = [q[1], q[3], q[5], q[7]];
+    const box = { left: Math.min(...xs), top: Math.min(...ys), width: Math.max(...xs) - Math.min(...xs), height: Math.max(...ys) - Math.min(...ys) };
+    return box.width >= 8 && box.height >= 8 ? box : undefined;
+  } catch { aborted(signal); return undefined; } // Not rendered (yet).
+}
+/** Finds the checkbox in a widget document; its box is relative to that document's frame viewport. */
+async function checkboxIn(client: CDPConnection, root: DomNode, widget: Widget, signal: AbortSignal) {
+  const { found, parents } = collect(root, widget.checkbox);
+  for (const node of found) {
+    // A styled checkbox may hide the <input> itself; fall back to its label/wrapper.
+    for (let current: DomNode | undefined = node, depth = 0; current && depth < 3; current = parents.get(current), depth++) {
+      if (current.nodeName === "#document-fragment") break;
+      const box = await boxOf(client, current.nodeId, signal);
+      if (box) return { box, checked: attr(node, "aria-checked") === "true" || attr(node, "checked") !== undefined };
+    }
+  }
+  return undefined;
+}
+async function findCheckbox(client: CDPConnection, signal: AbortSignal): Promise<{ seen: boolean; spot?: Spot }> {
+  const { root } = await client.send("DOM.getDocument", { depth: -1, pierce: true }, signal, 8000) as { root: DomNode };
+  let targets: Page[] | undefined, seen = false;
+  try {
+    for (const frame of collect(root, node => node.localName === "iframe").found) {
+      let url = attr(frame, "src") ?? "";
+      let widget = WIDGETS.find(item => item.frame.test(url));
+      if (!widget && frame.frameId && !frame.contentDocument) {
+        targets ??= await listTargets(signal).catch(() => { aborted(signal); return []; });
+        url = targets.find(target => target.id === frame.frameId)?.url ?? url;
+        widget = WIDGETS.find(item => item.frame.test(url));
+      }
+      if (!widget) continue;
+      seen = true;
+      await client.send("DOM.scrollIntoViewIfNeeded", { nodeId: frame.nodeId }, signal).catch(() => aborted(signal));
+      const frameBox = await boxOf(client, frame.nodeId, signal, "content");
+      if (!frameBox) continue;
+      let found: { box: Box; checked: boolean } | undefined, inspected = false;
+      if (frame.contentDocument) {
+        // Same-process frame: box coordinates are already relative to the main viewport.
+        inspected = true;
+        found = await checkboxIn(client, frame.contentDocument, widget, signal);
+      } else {
+        // Cross-origin frame in its own process: inspect it through its own target.
+        targets ??= await listTargets(signal).catch(() => { aborted(signal); return []; });
+        const target = targets.find(item => item.id === frame.frameId && item.webSocketDebuggerUrl);
+        if (target) {
+          const child = new CDPConnection();
+          try {
+            await child.connect(target.webSocketDebuggerUrl!, signal);
+            const doc = await child.send("DOM.getDocument", { depth: -1, pierce: true }, signal) as { root: DomNode };
+            inspected = true;
+            found = await checkboxIn(child, doc.root, widget, signal);
+            if (found) found.box = { ...found.box, left: found.box.left + frameBox.left, top: found.box.top + frameBox.top };
+          } catch { aborted(signal); } finally { child.close(); }
+        }
+      }
+      // Fixed offset only when the frame could not be inspected at all and has the standard
+      // (non-compact) layout; an inspected frame without a visible checkbox is still loading.
+      const spot = found ? { x: found.box.left + found.box.width / 2, y: found.box.top + found.box.height / 2, checked: found.checked } :
+        !inspected && frameBox.width >= 290 && frameBox.height <= 90 ? { x: frameBox.left + widget.fallbackX, y: frameBox.top + frameBox.height / 2, checked: false } : undefined;
+      if (!spot) continue;
+      const { cssLayoutViewport: view } = await client.send("Page.getLayoutMetrics", {}, signal);
+      if (spot.x < 1 || spot.y < 1 || spot.x >= view.clientWidth - 1 || spot.y >= view.clientHeight - 1) continue;
+      return { seen, spot: { widget: widget.name, ...spot } };
+    }
+    return { seen };
+  } finally {
+    // getDocument implicitly enables the DOM agent; stop its event stream again.
+    if (client.open) await client.send("DOM.disable", {}, undefined, 1500).catch(() => {});
+  }
+}
+async function humanClick(client: CDPConnection, x: number, y: number, signal: AbortSignal) {
+  x += (Math.random() - 0.5) * 4; y += (Math.random() - 0.5) * 4;
+  const fromX = Math.max(2, x - 60 - Math.random() * 120), fromY = y + 40 + Math.random() * 80;
+  const steps = 8 + Math.floor(Math.random() * 6);
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps, ease = t * t * (3 - 2 * t), wobble = i < steps ? (Math.random() - 0.5) * 3 : 0;
+    await client.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: fromX + (x - fromX) * ease + wobble, y: fromY + (y - fromY) * ease + wobble }, signal);
+    await sleep(10 + Math.random() * 25, signal);
+  }
+  await sleep(80 + Math.random() * 150, signal);
+  await pressAt(client, x, y, signal, 50 + Math.random() * 70);
+}
+async function captchaState(client: CDPConnection, signal: AbortSignal) {
+  try {
+    return await evaluate<{ captcha: boolean; puzzle: boolean }>(client, js(`return { captcha: reasonsFor().includes(${JSON.stringify(CAPTCHA)}), puzzle: puzzle() };`), signal);
+  } catch (error) {
+    if (!contextChanged(error)) throw error;
+    return { captcha: true, puzzle: false }; // Navigating, e.g. a Cloudflare interstitial that just passed.
+  }
+}
+export async function autoVerify(client: CDPConnection, signal: AbortSignal): Promise<{ passed: boolean; clicks: number; message: string }> {
+  const start = Date.now();
+  let clicks = 0, lastClick = 0, widget = "", seen = false;
+  const clickedPrefix = () => clicks ? `clicked the ${widget} checkbox, but ` : "";
+  while (Date.now() - start < VERIFY_TIMEOUT_MS) {
+    const state = await captchaState(client, signal);
+    if (!state.captcha) return { passed: true, clicks, message: clicks ? `passed after clicking the ${widget} checkbox` : "verification cleared without a click" };
+    if (state.puzzle) return { passed: false, clicks, message: `${clickedPrefix()}an image/puzzle challenge is showing; solve it manually` };
+    // Give a clicked widget time to verify before one retry.
+    if (clicks < 2 && Date.now() - lastClick > 7000) {
+      let found: Awaited<ReturnType<typeof findCheckbox>> = { seen: false };
+      try { found = await findCheckbox(client, signal); }
+      catch (error) { aborted(signal); if (!client.open) throw error; } // Page changed mid-scan; try again.
+      seen ||= found.seen;
+      if (found.spot && !found.spot.checked) {
+        await humanClick(client, found.spot.x, found.spot.y, signal);
+        clicks++; lastClick = Date.now(); widget = found.spot.widget;
+        await sleep(800, signal);
+        continue;
+      }
+      if (!seen && Date.now() - start > 8000) return { passed: false, clicks, message: "no supported checkbox widget (Turnstile, reCAPTCHA, hCaptcha) found" };
+    }
+    await sleep(500, signal);
+  }
+  return { passed: false, clicks, message: `${clickedPrefix()}verification did not complete within ${VERIFY_TIMEOUT_MS / 1000}s` };
+}
+
 class BrowserSession {
   client?: CDPConnection;
   page?: Page;
@@ -530,9 +744,7 @@ class BrowserSession {
     return abortable(task, signal);
   }
   async pages(signal?: AbortSignal): Promise<Page[]> {
-    const response = await fetch(`${CDP_URL}/json/list`, { signal: deadlineSignal(3000, signal) });
-    if (!response.ok) throw new Error(`Cannot list Chromium tabs: HTTP ${response.status}`);
-    return (await response.json() as Page[]).filter(page => page.type === "page" && page.webSocketDebuggerUrl);
+    return (await listTargets(signal)).filter(page => page.type === "page" && page.webSocketDebuggerUrl);
   }
   async get(signal?: AbortSignal, tabId?: string): Promise<CDPConnection> {
     if (this.client?.open && (!tabId || this.page?.id === tabId)) return this.client;
@@ -617,8 +829,27 @@ async function executeStep(client: CDPConnection, step: Step, signal: AbortSigna
   if (step.action === "fill") result = await fill(client, step.selector!, step.text!, signal);
   if (step.action === "press") result = await press(client, step.selector, step.key!, signal);
   if (step.action === "scroll") {
-    const position = await evaluate<{ x: number; y: number }>(client, js(`probe(); window.scrollBy({ top: ${step.deltaY ?? 600}, behavior: 'instant' }); return { x: scrollX, y: scrollY };`), signal);
-    result = `Scrolled to ${position.x}, ${position.y}`;
+    // Many app layouts scroll an inner container while the window itself cannot move.
+    const position = await evaluate<{ target: string; x: number; y: number }>(client, js(`
+      probe();
+      const delta = ${step.deltaY ?? 600}, before = scrollY;
+      window.scrollBy({ top: delta, behavior: 'instant' });
+      if (scrollY !== before || !delta) return { target: 'page', x: scrollX, y: scrollY };
+      const scrollable = el => el.scrollHeight > el.clientHeight && /(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY) && visible(el);
+      const chain = start => { const out = []; for (let el = start; el && el !== document.documentElement; el = el.parentElement) out.push(el); return out; };
+      // Prefer the focused element's container, then the one under the viewport centre, then the largest.
+      const area = el => { const r = el.getBoundingClientRect(); return Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0)) * Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0)); };
+      const rest = Array.from(document.body?.querySelectorAll('*') ?? []).slice(0, 8000).filter(scrollable).sort((a, b) => area(b) - area(a));
+      for (const el of [...chain(document.activeElement), ...chain(document.elementFromPoint(innerWidth / 2, innerHeight / 2)), ...rest]) {
+        if (!scrollable(el)) continue;
+        const top = el.scrollTop;
+        el.scrollBy({ top: delta, behavior: 'instant' });
+        if (el.scrollTop !== top) return { target: 'container', x: el.scrollLeft, y: el.scrollTop };
+      }
+      return { target: 'none', x: scrollX, y: scrollY };
+    `), signal);
+    result = position.target === "none" ? `Nothing scrolled (already at the edge?); page at ${position.x}, ${position.y}` :
+      `Scrolled ${position.target} to ${position.x}, ${position.y}`;
   }
   if (step.action === "check") result = "Checked page";
   if (step.action === "read") result = "Read page";
@@ -657,7 +888,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "chromium", label: "Termux Chromium",
     // No active-only promptSnippet/promptGuidelines: keep the system prefix stable.
-    description: "Control persistent Chromium for real interactive browser tasks, not ordinary search/retrieval. open/click/fill/press/scroll/wait/check return filtered rendered text and exact @refs including menu items, with open menus prioritized; do not immediately call read again. Text is not a pixel/occlusion guarantee: use screenshot to verify visual claims. Failures include fresh page refs, so use those instead of guessing selectors; missing CSS interaction targets default to 3s (override timeoutMs). Screenshot returns an image preview by default; path chooses a PNG file, gallery saves to Android DCIM/Screenshots with a bounded best-effort scan. Use returned @refs or unique CSS selectors. Set waitFor/waitText on the action for asynchronous results; wait without a condition waits for brief DOM stability, NOT a fixed sleep. Use batch for known dependent steps (one final page); never issue dependent calls in parallel. Batch stops at errors or manual gates; never blindly replay successful steps. Passwords, CAPTCHA, MFA and consent require manual noVNC handling; check resumes afterwards. tabs/switch handle popups explicitly. Main-document DOM only. Use screenshot only when requested or DOM information is insufficient.",
+    description: "Control persistent Chromium for real interactive browser tasks, not ordinary search/retrieval. open/click/fill/press/scroll/wait/check return filtered rendered text and exact @refs including menu items, with open menus prioritized; do not immediately call read again. Text is not a pixel/occlusion guarantee: use screenshot to verify visual claims. Failures include fresh page refs, so use those instead of guessing selectors; missing CSS interaction targets default to 3s (override timeoutMs). Screenshot returns an image preview by default; path chooses a PNG file, gallery saves to Android DCIM/Screenshots with a bounded best-effort scan. Use returned @refs or unique CSS selectors. Set waitFor/waitText on the action for asynchronous results; wait without a condition waits for brief DOM stability, NOT a fixed sleep. Use batch for known dependent steps (one final page); never issue dependent calls in parallel. Batch stops at errors or manual gates; never blindly replay successful steps. A human-verification checkbox (Cloudflare Turnstile, reCAPTCHA, hCaptcha) is clicked automatically once per non-read call; image/puzzle CAPTCHAs, passwords, MFA and consent require manual noVNC handling; check retries the checkbox or resumes afterwards. tabs/switch handle popups explicitly. Main-document DOM only. Use screenshot only when requested or DOM information is insufficient.",
     parameters,
     async execute(_id, input, signal, onUpdate, ctx) {
       const params = input as Params;
@@ -691,14 +922,31 @@ export default function (pi: ExtensionAPI) {
             ...(params.preview === false ? [] : [{ type: "image" as const, data: image.data, mimeType: "image/png" as const }]),
           ], details: { path, mediaScan, elapsedMs: Date.now() - start } };
         }
-        const completed: string[] = [];
-        let data: Snapshot | undefined, stopped = false;
+        const completed: string[] = [], verifyNotes: string[] = [];
+        let data: Snapshot | undefined, stopped = false, verifyTried = false;
+        // Same rule as the in-page guard: a login form alone does not block non-sensitive steps.
+        const blocked = (page?: Snapshot) => !!page?.reasons.some(reason => reason !== "login");
+        // At most one automatic attempt per call, so a failing widget cannot loop.
+        const autoPass = async (page: Snapshot) => {
+          if (!AUTO_VERIFY || verifyTried || !page.reasons.includes(CAPTCHA)) return false;
+          verifyTried = true;
+          onUpdate?.({ content: [{ type: "text", text: "Human verification detected; trying its checkbox automatically…" }], details: {} });
+          const outcome = await autoVerify(client, activeSignal);
+          verifyNotes.push(`Auto verification: ${outcome.message}`);
+          if (outcome.passed) await waitForPage(client, { timeoutMs: 8000 }, activeSignal);
+          return outcome.passed;
+        };
+        const gate = async () => {
+          let page = await inspect(client, undefined, 0, 0, activeSignal);
+          if (blocked(page) && await autoPass(page)) page = await inspect(client, undefined, 0, 0, activeSignal);
+          return page;
+        };
         for (let i = 0; i < steps.length; i++) {
-          const step = steps[i];
+          const step = steps[i], gated = !["open", "check", "read", "wait", "scroll"].includes(step.action);
+          // Later batch steps reuse the safety inspection performed after the preceding step.
+          if (i === 0 && (params.action === "batch" || gated)) data = await gate();
           if (params.action === "batch") {
-            // Later steps reuse the safety inspection performed after the preceding step.
-            if (i === 0) data = await snapshot(client, undefined, 0, 0, activeSignal);
-            if (data?.requiresUserAction && !["open", "check", "read", "wait", "scroll"].includes(step.action)) { stopped = true; break; }
+            if (gated && blocked(data)) { stopped = true; break; }
             onUpdate?.({ content: [{ type: "text", text: `Browser step ${i + 1}/${steps.length}: ${step.action}` }], details: { completed: i, total: steps.length } });
           }
           try {
@@ -709,11 +957,11 @@ export default function (pi: ExtensionAPI) {
             let diagnostic = "";
             try { diagnostic = "\n\nCurrent page (read-only diagnostic; no action replayed):\n" + formatPage(await snapshot(client, undefined, 1200, 32, activeSignal)); }
             catch { aborted(activeSignal); }
-            throw new Error(limitOutput(`${params.action === "batch" ? `Batch stopped at step ${i + 1}/${steps.length}. Completed ${completed.length} step(s).\n${completed.join("\n")}\n` : ""}${String(error)}\nThe current action may have taken effect. Successful steps are NOT rolled back. Use the current refs below; do not blindly replay actions.${diagnostic}`));
+            throw new Error(limitOutput(`${params.action === "batch" ? `Batch stopped at step ${i + 1}/${steps.length}. Completed ${completed.length} step(s).\n${completed.join("\n")}\n` : ""}${verifyNotes.map(note => note + "\n").join("")}${String(error)}\nThe current action may have taken effect. Successful steps are NOT rolled back. Use the current refs below; do not blindly replay actions.${diagnostic}`));
           }
           if (params.action === "batch" && i < steps.length - 1) {
-            data = await snapshot(client, undefined, 0, 0, activeSignal);
-            if (data.requiresUserAction) { stopped = true; break; }
+            data = await gate();
+            if (blocked(data)) { stopped = true; break; }
           }
         }
         const last = steps[completed.length - 1];
@@ -722,10 +970,10 @@ export default function (pi: ExtensionAPI) {
         const root = !stopped && last?.action === "read" ? last.selector : undefined;
         const maxChars = params.report === "status" ? 0 : params.maxChars ?? 2500;
         const maxElements = params.report === "status" ? 0 : params.maxElements ?? 24;
-        // Read-only retry is safe when a navigation replaces the execution context.
-        for (let attempt = 0; ; attempt++) {
-          try { data = await snapshot(client, root, maxChars, maxElements, activeSignal); break; }
-          catch (error) { if (attempt >= 2 || !contextChanged(error)) throw error; await sleep(80, activeSignal); }
+        data = await inspect(client, root, maxChars, maxElements, activeSignal);
+        // A plain read never interacts with the page; every other action may pass a checkbox gate.
+        if (!["read", "tabs", "switch"].includes(params.action) && await autoPass(data)) {
+          data = await inspect(client, root, maxChars, maxElements, activeSignal);
         }
         let handoff = "";
         if (data.requiresUserAction) {
@@ -733,11 +981,12 @@ export default function (pi: ExtensionAPI) {
           catch (error) { aborted(activeSignal); handoff = `\nUser action required (${data.reasons.join(", ")}). Viewer unavailable: ${String(error)}`; }
         }
         const elapsedMs = Date.now() - start;
-        const status = `${completed.join("\n")}${stopped ? `\nBatch paused at a manual gate. ${steps.length - completed.length} step(s) NOT executed.` : ""}`;
+        const status = [...completed, ...verifyNotes].join("\n") +
+          (stopped ? `\nBatch paused at a manual gate. ${steps.length - completed.length} step(s) NOT executed.` : "");
         return {
           content: [{ type: "text" as const, text: `${status}${status ? "\n\n" : ""}${formatPage(data)}${handoff}\n[${elapsedMs}ms]` }],
           details: { ...data, action: params.action, completed: completed.length, stopped, elapsedMs, tabId: browser.page?.id,
-            viewerUrl: data.requiresUserAction ? NOVNC_URL : undefined },
+            autoVerify: verifyNotes[0], viewerUrl: data.requiresUserAction ? NOVNC_URL : undefined },
         };
       }, signal);
     },
