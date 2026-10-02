@@ -217,6 +217,42 @@ const DOM = String.raw`
   const store = globalThis[storeKey] ||= {
     prefix: Math.random().toString(36).slice(2, 10), next: 0, refs: new Map(), ids: new WeakMap()
   };
+  // Open shadow DOM is treated like ordinary DOM; closed shadow roots are unreachable from page JS.
+  // Flat-tree parent: a slotted node renders inside its slot, a shadow root's content inside its host.
+  const parentOf = node => node.assignedSlot || node.parentElement || (node.parentNode instanceof ShadowRoot ? node.parentNode.host : null);
+  const closestDeep = (el, selector) => { for (let p = el; p; p = parentOf(p)) if (p.matches?.(selector)) return p; return null; };
+  const containsDeep = (el, node) => { for (let p = node; p; p = parentOf(p)) if (p === el) return true; return false; };
+  const deepActive = () => { let el = document.activeElement; while (el?.shadowRoot?.activeElement) el = el.shadowRoot.activeElement; return el; };
+  const deepElementFromPoint = (x, y) => {
+    let el = document.elementFromPoint(x, y);
+    for (let inner; el?.shadowRoot && (inner = el.shadowRoot.elementFromPoint(x, y)) && inner !== el;) el = inner;
+    return el;
+  };
+  let rootsMemo;
+  const shadowRoots = () => {
+    if (!rootsMemo) {
+      rootsMemo = [];
+      const scan = scope => { for (const el of scope.querySelectorAll('*')) if (el.shadowRoot) { rootsMemo.push(el.shadowRoot); scan(el.shadowRoot); } };
+      scan(document);
+    }
+    return rootsMemo;
+  };
+  // CSS matched inside every open shadow root too, in rendering order; "a >>> b" finds b anywhere under a.
+  const queryAll = (selector, scope = document) => {
+    let scopes = [scope];
+    for (const part of selector.split('>>>').map(item => item.trim())) {
+      if (!part) throw new SyntaxError('empty selector part');
+      const found = [];
+      for (const current of scopes) {
+        if (!shadowRoots().length) { found.push(...current.querySelectorAll(part)); continue; }
+        const visit = root => { for (const el of root.querySelectorAll('*')) { if (el.matches(part)) found.push(el); if (el.shadowRoot) visit(el.shadowRoot); } };
+        if (current.shadowRoot) visit(current.shadowRoot);
+        visit(current);
+      }
+      scopes = [...new Set(found)];
+    }
+    return scopes;
+  };
   // DOM presence/innerText alone is not evidence of a currently displayed panel.
   // Cached per evaluation; do not reuse visible() results across a scroll.
   const hiddenCache = new Map(), clipCache = new Map();
@@ -226,7 +262,7 @@ const DOM = String.raw`
     if (hidden === undefined) {
       const s = getComputedStyle(el);
       hidden = el.matches('[inert],[aria-hidden="true"]') || s.display === 'none' || s.contentVisibility === 'hidden' ||
-        Number(s.opacity) === 0 || hiddenTree(el.parentElement);
+        Number(s.opacity) === 0 || hiddenTree(parentOf(el));
       hiddenCache.set(el, hidden);
     }
     return hidden;
@@ -241,7 +277,7 @@ const DOM = String.raw`
     let clip = clipCache.get(el);
     if (!clip) {
       const s = getComputedStyle(el), clipX = /(hidden|clip|scroll|auto)/.test(s.overflowX), clipY = /(hidden|clip|scroll|auto)/.test(s.overflowY);
-      clip = { ...clipOf(el.parentElement) };
+      clip = { ...clipOf(parentOf(el)) };
       if (clipX || clipY) {
         const r = el.getBoundingClientRect();
         if (clipX) { clip.left = Math.max(clip.left, r.left); clip.right = Math.min(clip.right, r.right); }
@@ -256,28 +292,32 @@ const DOM = String.raw`
     return Math.min(rect.right, clip.right) > Math.max(rect.left, clip.left) && Math.min(rect.bottom, clip.bottom) > Math.max(rect.top, clip.top);
   };
   const visible = el => el instanceof Element && !suppressed(el) &&
-    Array.from(el.getClientRects()).some(r => unclipped(r, el.parentElement));
+    Array.from(el.getClientRects()).some(r => unclipped(r, parentOf(el)));
   const visibleText = (root, limit = 16001) => {
     const parts = []; let length = 0, visited = 0;
     const add = text => { if (length <= limit) { const chunk = text.slice(0, limit + 1 - length); parts.push(chunk); length += chunk.length; } };
     const walk = (node, depth) => {
       if (length > limit || ++visited > 30000 || depth > 200) return;
       if (node.nodeType === Node.TEXT_NODE) {
-        if (!node.parentElement || suppressed(node.parentElement)) return;
+        const parent = parentOf(node);
+        if (!parent || suppressed(parent)) return;
         const range = document.createRange(); range.selectNodeContents(node);
-        if (Array.from(range.getClientRects()).some(r => unclipped(r, node.parentElement))) add(node.textContent.replace(/\s+/g, ' '));
+        if (Array.from(range.getClientRects()).some(r => unclipped(r, parent))) add(node.textContent.replace(/\s+/g, ' '));
         return;
       }
       if (!(node instanceof Element) || node.matches('script,style,noscript,template') || suppressed(node)) return;
       const block = !['inline','contents'].includes(getComputedStyle(node).display);
       if (block || node.tagName === 'BR') add('\n');
-      for (const child of node.childNodes) { walk(child, depth + 1); if (length > limit || visited > 30000) break; }
+      // Rendered children: a host shows its shadow root, a slot its assigned nodes (or its fallback).
+      const assigned = node instanceof HTMLSlotElement ? node.assignedNodes() : [];
+      const children = node.shadowRoot ? node.shadowRoot.childNodes : assigned.length ? assigned : node.childNodes;
+      for (const child of children) { walk(child, depth + 1); if (length > limit || visited > 30000) break; }
       if (block) add('\n');
     };
     walk(root, 0);
     return parts.join('').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
   };
-  const disabled = el => !!el.disabled || el.getAttribute('aria-disabled') === 'true' || !!el.closest('[inert]');
+  const disabled = el => !!el.disabled || el.getAttribute('aria-disabled') === 'true' || !!closestDeep(el, '[inert]');
   const sensitive = el => {
     if (!el) return false;
     const meta = ['type','name','autocomplete','aria-label','placeholder','id'].map(a => el.getAttribute(a) || '').join(' ');
@@ -289,7 +329,7 @@ const DOM = String.raw`
       const el = store.refs.get(selector);
       return el?.isConnected && el.ownerDocument === document ? [el] : [];
     }
-    try { return Array.from(document.querySelectorAll(selector)); }
+    try { return queryAll(selector); }
     catch { throw new Error('Invalid CSS selector: ' + selector); }
   };
   const find = (selector, optional = false) => {
@@ -307,19 +347,21 @@ const DOM = String.raw`
   };
   const nameFor = el => (el.getAttribute('aria-label') ||
     (el.labels && Array.from(el.labels).map(l => visibleText(l, 180)).join(' ')) ||
-    el.getAttribute('placeholder') || visibleText(el, 180) || el.getAttribute('name') || el.getAttribute('title') || '').trim().slice(0, 90);
+    el.getAttribute('placeholder') || visibleText(el, 180) || el.getAttribute('name') || el.getAttribute('title') ||
+    // An empty rich-text box is often named only by a placeholder element beside it.
+    (el.isContentEditable ? el.getAttribute('aria-placeholder') || el.getAttribute('data-placeholder') || visibleText(parentOf(el), 90) : '') || '').trim().slice(0, 90);
   const semanticSelector = el => {
     const candidates = el.id ? ['#' + CSS.escape(el.id)] : [];
     for (const attr of ['data-testid','aria-label','name','placeholder']) {
       const value = el.getAttribute(attr);
       if (value) candidates.push(el.tagName.toLowerCase() + '[' + attr + '="' + CSS.escape(value) + '"]');
     }
-    return candidates.find(s => { if (s.length > 180) return false; try { return document.querySelectorAll(s).length === 1; } catch { return false; } });
+    return candidates.find(s => { if (s.length > 180) return false; try { return queryAll(s).length === 1; } catch { return false; } });
   };
-  const hasVisible = selector => Array.from(document.querySelectorAll(selector)).some(visible);
+  const hasVisible = selector => queryAll(selector).some(visible);
   // A filled response token means the widget was passed.
   const solved = el => {
-    for (let p = el; p && p !== document.documentElement; p = p.parentElement) {
+    for (let p = el; p && p !== document.documentElement; p = parentOf(p)) {
       const token = p.querySelector('[name="g-recaptcha-response"],[name="h-captcha-response"],[name="cf-turnstile-response"]');
       if (token) return !!token.value;
     }
@@ -327,21 +369,21 @@ const DOM = String.raw`
   };
   // reCAPTCHA by bframe only: hCaptcha's checkbox frame URL contains "recaptchacompat".
   const puzzle = () => hasVisible('iframe[src*="/recaptcha/"][src*="/bframe"],iframe[src*="hcaptcha"][src*="frame=challenge"]');
-  const pendingWidget = () => Array.from(document.querySelectorAll(
+  const pendingWidget = () => queryAll(
     // Invisible widgets are only a badge; Turnstile's iframe may be in a closed shadow root.
     '.g-recaptcha:not([data-size="invisible"]),.h-captcha:not([data-size="invisible"]),.cf-turnstile,' +
     'iframe[src*="hcaptcha"][src*="frame=checkbox"],iframe[src*="challenges.cloudflare"],input[name="cf-turnstile-response"]'
-  )).some(el => (el.type === 'hidden' ? !!el.parentElement && visible(el.parentElement) : visible(el)) && !solved(el));
+  ).some(el => (el.type === 'hidden' ? !!parentOf(el) && visible(parentOf(el)) : visible(el)) && !solved(el));
   const reasonsFor = () => {
     const reasons = [], url = location.href;
     const challenge = /\/sorry\/|challenges\.cloudflare\./i.test(url) || typeof window._cf_chl_opt === 'object' ||
       puzzle() || pendingWidget();
     // Do not treat an ordinary mention of "email address" or "验证码" as a login wall.
-    const heading = Array.from(document.querySelectorAll('h1,h2,[role="heading"]')).filter(visible).map(el => visibleText(el, 500)).join(' ');
+    const heading = queryAll('h1,h2,[role="heading"]').filter(visible).map(el => visibleText(el, 500)).join(' ');
     if (challenge || /verify you are human|checking your browser|unusual traffic|人机验证/i.test(heading)) reasons.push('CAPTCHA or human verification');
     if (hasVisible('input[type="password"]') || (/\/(login|signin|sign-in)([/?#]|$)/i.test(url) && hasVisible('input[type="email"],input[autocomplete="username"]'))) reasons.push('login');
-    if (Array.from(document.querySelectorAll('input')).some(el => visible(el) && el.type !== 'password' && sensitive(el))) reasons.push('MFA or verification code');
-    if (/oauth|authorize|consent/i.test(url) && /allow|authorize|approve|consent|授权|同意/i.test(heading + ' ' + Array.from(document.querySelectorAll('button')).filter(visible).map(el => visibleText(el, 180)).join(' '))) reasons.push('authorization or consent');
+    if (queryAll('input').some(el => visible(el) && el.type !== 'password' && sensitive(el))) reasons.push('MFA or verification code');
+    if (/oauth|authorize|consent/i.test(url) && /allow|authorize|approve|consent|授权|同意/i.test(heading + ' ' + queryAll('button').filter(visible).map(el => visibleText(el, 180)).join(' '))) reasons.push('authorization or consent');
     return reasons;
   };
   const guard = el => {
@@ -355,7 +397,7 @@ const DOM = String.raw`
   const probe = (action = false) => {
     let watch = store.watch;
     if (!watch) {
-      watch = store.watch = { changed: Date.now(), touched: Date.now(), nodes: new WeakMap() };
+      watch = store.watch = { changed: Date.now(), touched: Date.now(), nodes: new WeakMap(), roots: new WeakSet(), rootScan: 0 };
       watch.observer = new MutationObserver(records => {
         const now = Date.now();
         for (const record of records) {
@@ -368,11 +410,17 @@ const DOM = String.raw`
           if (!noise) watch.changed = now;
         }
       });
-      watch.observer.observe(document, { childList: true, subtree: true, attributes: true, characterData: true });
+      watch.options = { childList: true, subtree: true, attributes: true, characterData: true };
+      watch.observer.observe(document, watch.options);
       // Kept 15s so noise is known at the next action; self-cleans if the host goes away.
       watch.timer = setInterval(() => {
         if (Date.now() - watch.touched > 15000) { watch.observer.disconnect(); clearInterval(watch.timer); if (store.watch === watch) delete store.watch; }
       }, 1000);
+    }
+    // Observers do not see into shadow roots, so each one is observed as it appears.
+    if (Date.now() - watch.rootScan > 400) {
+      watch.rootScan = Date.now();
+      for (const root of shadowRoots()) if (!watch.roots.has(root)) { watch.roots.add(root); watch.observer.observe(root, watch.options); }
     }
     if (action) watch.changed = watch.action = Date.now();
     watch.touched = Date.now();
@@ -388,10 +436,10 @@ async function snapshot(client: CDPConnection, selector: string | undefined, max
     for (const [ref, el] of store.refs) if (!el.isConnected) store.refs.delete(ref);
     while (store.refs.size > 1000) store.refs.delete(store.refs.keys().next().value);
     const text = ${maxChars} > 0 ? visibleText(root, ${maxChars} + 1000) : '';
-    const elements = [], controls = 'a[href],button,input:not([type="hidden"]),textarea,select,[role="button"],[role="checkbox"],[role="tab"],[role="menuitem"],[role="menuitemradio"],[role="menuitemcheckbox"],[role="option"],[role="radio"],[role="switch"],[role="combobox"],[role="slider"],[role="treeitem"],[tabindex]:not([tabindex="-1"]),[contenteditable="true"]';
-    const candidates = ${maxElements} > 0 ? [...(root.matches(controls) ? [root] : []), ...root.querySelectorAll(controls)] : [];
+    const elements = [], controls = 'a[href],button,input:not([type="hidden"]),textarea,select,[role="button"],[role="checkbox"],[role="tab"],[role="menuitem"],[role="menuitemradio"],[role="menuitemcheckbox"],[role="option"],[role="radio"],[role="switch"],[role="combobox"],[role="slider"],[role="treeitem"],[tabindex]:not([tabindex="-1"]),[contenteditable="true"],[contenteditable=""],[contenteditable="plaintext-only"]';
+    const candidates = ${maxElements} > 0 ? [...(root.matches(controls) ? [root] : []), ...queryAll(controls, root)] : [];
     // Portalled menus are commonly last in DOM order; don't lose them to the limit.
-    const overlay = el => !!el.closest('[role="menu"],[role="listbox"],[role="dialog"],[aria-modal="true"],[popover]:popover-open');
+    const overlay = el => !!closestDeep(el, '[role="menu"],[role="listbox"],[role="dialog"],[aria-modal="true"],[popover]:popover-open');
     candidates.sort((a, b) => Number(overlay(b)) - Number(overlay(a)));
     for (const el of candidates) {
       const rect = el.getBoundingClientRect();
@@ -399,7 +447,7 @@ async function snapshot(client: CDPConnection, selector: string | undefined, max
       if (!visible(el)) continue;
       const secret = sensitive(el);
       elements.push({ ref: refFor(el), selector: semanticSelector(el), tag: el.tagName.toLowerCase(),
-        name: secret ? '[sensitive field]' : nameFor(el), type: el instanceof HTMLInputElement ? el.type : undefined,
+        name: secret ? '[sensitive field]' : nameFor(el), type: el instanceof HTMLInputElement ? el.type : el.isContentEditable ? 'editable' : undefined,
         role: el.getAttribute('role') || undefined, expanded: el.getAttribute('aria-expanded') ?? undefined,
         checked: el.getAttribute('aria-checked') ?? el.getAttribute('aria-selected') ?? undefined,
         disabled: disabled(el), sensitive: secret });
@@ -408,7 +456,7 @@ async function snapshot(client: CDPConnection, selector: string | undefined, max
     const reasons = reasonsFor();
     return { title: document.title.slice(0, 240), url: location.href, readyState: document.readyState,
       text: text.slice(0, ${maxChars}), truncated: text.length > ${maxChars}, elements,
-      reasons, requiresUserAction: reasons.length > 0, frames: document.querySelectorAll('iframe,frame').length };
+      reasons, requiresUserAction: reasons.length > 0, frames: queryAll('iframe,frame').length };
   `), signal);
 }
 
@@ -441,8 +489,10 @@ async function waitForPage(client: CDPConnection, options: { selector?: string; 
         }
         // Cheap prefilter: visibleText only rewrites whitespace.
         if (text !== undefined) {
-          const raw = document.body?.textContent ?? '';
-          matches = matches && !!document.body && text.split(/\s+/).every(part => raw.includes(part)) &&
+          // Slots can join shadow and light text into one word, so the prefilter is skipped there.
+          const roots = shadowRoots(), raw = roots.some(root => root.querySelector('slot')) ? null :
+            [document.body, ...roots].map(node => node?.textContent ?? '').join(' ');
+          matches = matches && !!document.body && (raw === null || text.split(/\s+/).every(part => raw.includes(part))) &&
             visibleText(document.body, 200000).includes(text);
         }
         return { done: ${explicit} ? matches : document.readyState !== 'loading' && quiet >= 160 };
@@ -465,8 +515,8 @@ async function click(client: CDPConnection, selector: string, signal?: AbortSign
       const left = Math.max(0, r.left), right = Math.min(innerWidth, r.right), top = Math.max(0, r.top), bottom = Math.min(innerHeight, r.bottom);
       if (right <= left || bottom <= top) continue;
       for (const [fx, fy] of [[.5,.5],[.2,.2],[.8,.2],[.2,.8],[.8,.8]]) {
-        const x = left + (right-left)*fx, y = top + (bottom-top)*fy, hit = document.elementFromPoint(x, y);
-        if (hit === el || el.contains(hit)) return { x, y, tag: el.tagName.toLowerCase() };
+        const x = left + (right-left)*fx, y = top + (bottom-top)*fy, hit = deepElementFromPoint(x, y);
+        if (containsDeep(el, hit)) return { x, y, tag: el.tagName.toLowerCase() };
       }
     }
     throw new Error('Element is covered or outside the viewport; no click was sent. Read the page or dismiss the overlay.');
@@ -550,7 +600,7 @@ async function fill(client: CDPConnection, selector: string, text: string, signa
   const prepared = await evaluate<{ mode: string; ref: string }>(client, js(`
     const el = find(${JSON.stringify(selector)}); guard(el); probe(true);
     el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); el.focus();
-    if (document.activeElement !== el) throw new Error('Element could not receive focus.');
+    if (deepActive() !== el) throw new Error('Element could not receive focus.');
     const value = ${JSON.stringify(text)};
     if (el instanceof HTMLSelectElement) {
       const matches = Array.from(el.options).filter(o => o.value === value);
@@ -570,7 +620,7 @@ async function fill(client: CDPConnection, selector: string, text: string, signa
   // Recheck focus/sensitivity after key events, which site handlers may intercept.
   await evaluate(client, js(`
     const el = find(${JSON.stringify(prepared.ref)}); guard(el);
-    if (document.activeElement !== el) throw new Error('Focus changed before insertion; text was not sent.');
+    if (deepActive() !== el) throw new Error('Focus changed before insertion; text was not sent.');
     return true;
   `), signal);
   if (text) await client.send("Input.insertText", { text }, signal);
@@ -584,11 +634,11 @@ async function fill(client: CDPConnection, selector: string, text: string, signa
 }
 async function press(client: CDPConnection, selector: string | undefined, key: string, signal?: AbortSignal) {
   await evaluate(client, js(`
-    const el = ${JSON.stringify(selector)} ? find(${JSON.stringify(selector)}) : document.activeElement;
+    const el = ${JSON.stringify(selector)} ? find(${JSON.stringify(selector)}) : deepActive();
     guard(el); probe(true);
     if (${Boolean(selector)}) {
       el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); el.focus();
-      if (document.activeElement !== el) throw new Error('Element could not receive keyboard focus.');
+      if (deepActive() !== el) throw new Error('Element could not receive keyboard focus.');
     }
     return true;
   `), signal);
@@ -802,7 +852,7 @@ class BrowserSession {
 const STEP_ACTIONS = ["open", "check", "read", "click", "fill", "press", "scroll", "wait"] as const;
 const common = {
   target: Type.Optional(Type.String({ description: "Fully qualified http(s) URL for open" })),
-  selector: Type.Optional(Type.String({ description: "Exact @ref from page output (preferred) or unique CSS selector; required for click/fill" })),
+  selector: Type.Optional(Type.String({ description: "Exact @ref from page output (preferred) or unique CSS selector (also matches in open shadow DOM; 'host >>> inner' scopes); required for click/fill" })),
   text: Type.Optional(Type.String({ description: "Text for fill; never passwords or verification codes" })),
   key: Type.Optional(Type.String({ description: "Key or chord for press: Enter, Tab, Escape, Ctrl+a, Shift+Tab, or one character" })),
   deltaY: Type.Optional(Type.Integer({ minimum: -10000, maximum: 10000 })),
@@ -865,10 +915,10 @@ async function executeStep(client: CDPConnection, step: Step, signal: AbortSigna
       window.scrollBy({ top: delta, behavior: 'instant' });
       if (scrollY !== before || !delta) return { target: 'page', x: scrollX, y: scrollY };
       const scrollable = el => el.scrollHeight > el.clientHeight && /(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY) && visible(el);
-      const chain = start => { const out = []; for (let el = start; el && el !== document.documentElement; el = el.parentElement) out.push(el); return out; };
+      const chain = start => { const out = []; for (let el = start; el && el !== document.documentElement; el = parentOf(el)) out.push(el); return out; };
       const area = el => { const r = el.getBoundingClientRect(); return Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0)) * Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0)); };
-      const rest = Array.from(document.body?.querySelectorAll('*') ?? []).slice(0, 8000).filter(scrollable).sort((a, b) => area(b) - area(a));
-      for (const el of [...chain(document.activeElement), ...chain(document.elementFromPoint(innerWidth / 2, innerHeight / 2)), ...rest]) {
+      const rest = (document.body ? queryAll('*', document.body) : []).slice(0, 8000).filter(scrollable).sort((a, b) => area(b) - area(a));
+      for (const el of [...chain(deepActive()), ...chain(deepElementFromPoint(innerWidth / 2, innerHeight / 2)), ...rest]) {
         if (!scrollable(el)) continue;
         const top = el.scrollTop;
         el.scrollBy({ top: delta, behavior: 'instant' });
@@ -916,7 +966,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "chromium", label: "Termux Chromium",
     // No active-only promptSnippet/promptGuidelines: keep the system prefix stable.
-    description: "Control persistent Chromium for real interactive browser tasks, not ordinary search/retrieval. open/click/fill/press/scroll/wait/check return filtered rendered text and exact @refs including menu items, with open menus prioritized; do not immediately call read again. Text is not a pixel/occlusion guarantee: use screenshot to verify visual claims. Failures include fresh page refs, so use those instead of guessing selectors; missing CSS interaction targets default to 3s (override timeoutMs). Screenshot returns an image preview by default; path chooses a PNG file, gallery saves to Android DCIM/Screenshots with a bounded best-effort scan. Use returned @refs or unique CSS selectors. Set waitFor/waitText on the action for asynchronous results; wait without a condition waits for brief DOM stability, NOT a fixed sleep. Use batch for known dependent steps (one final page); never issue dependent calls in parallel. Batch stops at errors or manual gates; never blindly replay successful steps. Verification checkboxes are clicked automatically; image CAPTCHAs, passwords, MFA and consent require manual noVNC handling; check resumes afterwards. tabs/switch handle popups explicitly. Main-document DOM only. Use screenshot only when requested or DOM information is insufficient.",
+    description: "Control persistent Chromium for real interactive browser tasks, not ordinary search/retrieval. open/click/fill/press/scroll/wait/check return filtered rendered text and exact @refs including menu items, with open menus prioritized; do not immediately call read again. Text is not a pixel/occlusion guarantee: use screenshot to verify visual claims. Failures include fresh page refs, so use those instead of guessing selectors; missing CSS interaction targets default to 3s (override timeoutMs). Screenshot returns an image preview by default; path chooses a PNG file, gallery saves to Android DCIM/Screenshots with a bounded best-effort scan. Use returned @refs or unique CSS selectors. Set waitFor/waitText on the action for asynchronous results; wait without a condition waits for brief DOM stability, NOT a fixed sleep. Use batch for known dependent steps (one final page); never issue dependent calls in parallel. Batch stops at errors or manual gates; never blindly replay successful steps. Verification checkboxes are clicked automatically; image CAPTCHAs, passwords, MFA and consent require manual noVNC handling; check resumes afterwards. tabs/switch handle popups explicitly. Main document and open shadow DOM only, no iframes. Use screenshot only when requested or DOM information is insufficient.",
     parameters,
     async execute(_id, input, signal, onUpdate, ctx) {
       const params = input as Params;
