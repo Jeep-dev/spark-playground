@@ -218,9 +218,7 @@ const DOM = String.raw`
     prefix: Math.random().toString(36).slice(2, 10), next: 0, refs: new Map(), ids: new WeakMap()
   };
   // DOM presence/innerText alone is not evidence of a currently displayed panel.
-  // Ancestor results are cached for this one evaluation (the prelude runs fresh per call), so each
-  // element's style is read once instead of once per descendant text node. Callers that scroll
-  // must not reuse visible() results from before the scroll.
+  // Cached per evaluation; do not reuse visible() results across a scroll.
   const hiddenCache = new Map(), clipCache = new Map();
   const hiddenTree = el => {
     if (!el) return false;
@@ -238,7 +236,6 @@ const DOM = String.raw`
     const s = getComputedStyle(el);
     return s.visibility === 'hidden' || s.visibility === 'collapse';
   };
-  // The viewport area left to an element's content after every ancestor's overflow clipping.
   const clipOf = el => {
     if (!el) return { left: -Infinity, top: -Infinity, right: Infinity, bottom: Infinity };
     let clip = clipCache.get(el);
@@ -320,7 +317,7 @@ const DOM = String.raw`
     return candidates.find(s => { if (s.length > 180) return false; try { return document.querySelectorAll(s).length === 1; } catch { return false; } });
   };
   const hasVisible = selector => Array.from(document.querySelectorAll(selector)).some(visible);
-  // A widget whose response token is filled has been passed and no longer gates the page.
+  // A filled response token means the widget was passed.
   const solved = el => {
     for (let p = el; p && p !== document.documentElement; p = p.parentElement) {
       const token = p.querySelector('[name="g-recaptcha-response"],[name="h-captcha-response"],[name="cf-turnstile-response"]');
@@ -328,12 +325,10 @@ const DOM = String.raw`
     }
     return false;
   };
-  // Image/puzzle challenges are never automated. Match reCAPTCHA by its bframe path only:
-  // hCaptcha's checkbox frame has "recaptchacompat" in its URL and "challenge" in its title.
+  // reCAPTCHA by bframe only: hCaptcha's checkbox frame URL contains "recaptchacompat".
   const puzzle = () => hasVisible('iframe[src*="/recaptcha/"][src*="/bframe"],iframe[src*="hcaptcha"][src*="frame=challenge"]');
   const pendingWidget = () => Array.from(document.querySelectorAll(
-    // Invisible reCAPTCHA/hCaptcha only show a badge; they are not a gate. Turnstile's iframe is
-    // often inside a closed shadow root, so its light-DOM response input marks the widget.
+    // Invisible widgets are only a badge; Turnstile's iframe may be in a closed shadow root.
     '.g-recaptcha:not([data-size="invisible"]),.h-captcha:not([data-size="invisible"]),.cf-turnstile,' +
     'iframe[src*="hcaptcha"][src*="frame=checkbox"],iframe[src*="challenges.cloudflare"],input[name="cf-turnstile-response"]'
   )).some(el => (el.type === 'hidden' ? !!el.parentElement && visible(el.parentElement) : visible(el)) && !solved(el));
@@ -356,8 +351,7 @@ const DOM = String.raw`
     const reasons = reasonsFor();
     if (reasons.some(r => r !== 'login')) throw new Error('Manual user action required: ' + reasons.join(', ') + '. Use check to retry automatic verification or open noVNC.');
   };
-  // probe(true) marks the start of an action: quiet time is measured from it, so an effect that
-  // lands a few ms after the click is not missed because the page had been quiet before.
+  // probe(true) starts the quiet window at an action.
   const probe = (action = false) => {
     let watch = store.watch;
     if (!watch) {
@@ -368,18 +362,14 @@ const DOM = String.raw`
           const target = record.type === 'characterData' ? record.target.parentNode : record.target;
           let node = watch.nodes.get(target);
           if (!node) watch.nodes.set(target, node = { count: 0, first: now });
-          // A node that keeps rewriting itself (clock, ticker) is background noise once it has changed
-          // a few times, if it was already doing so before the current action (or there was none since
-          // load); otherwise such pages never settle. A spinner started by the action and newly added
-          // elements always count as progress.
+          // Nodes already rewriting themselves before the action (clocks, tickers) are noise.
           const noise = node.count++ >= 3 && (watch.action === undefined || node.first < watch.action) &&
             !Array.from(record.addedNodes).some(added => added.nodeType === Node.ELEMENT_NODE);
           if (!noise) watch.changed = now;
         }
       });
       watch.observer.observe(document, { childList: true, subtree: true, attributes: true, characterData: true });
-      // Kept between calls so background noise is already known at the next action; disconnects itself
-      // after 15s idle even if the host cancels, disconnects or the tab becomes inactive.
+      // Kept 15s so noise is known at the next action; self-cleans if the host goes away.
       watch.timer = setInterval(() => {
         if (Date.now() - watch.touched > 15000) { watch.observer.disconnect(); clearInterval(watch.timer); if (store.watch === watch) delete store.watch; }
       }, 1000);
@@ -404,7 +394,6 @@ async function snapshot(client: CDPConnection, selector: string | undefined, max
     const overlay = el => !!el.closest('[role="menu"],[role="listbox"],[role="dialog"],[aria-modal="true"],[popover]:popover-open');
     candidates.sort((a, b) => Number(overlay(b)) - Number(overlay(a)));
     for (const el of candidates) {
-      // The cheap viewport test first: most links on a long page are off-screen.
       const rect = el.getBoundingClientRect();
       if (!${Boolean(selector)} && (rect.bottom <= 0 || rect.right <= 0 || rect.top >= innerHeight || rect.left >= innerWidth)) continue;
       if (!visible(el)) continue;
@@ -423,7 +412,7 @@ async function snapshot(client: CDPConnection, selector: string | undefined, max
   `), signal);
 }
 
-/** Read-only, so retrying is safe while a navigation replaces the execution context or body. */
+/** Read-only, so safe to retry across navigations. */
 async function inspect(client: CDPConnection, selector: string | undefined, maxChars: number, maxElements: number, signal?: AbortSignal) {
   for (let attempt = 0; ; attempt++) {
     try { return await snapshot(client, selector, maxChars, maxElements, signal); }
@@ -450,8 +439,7 @@ async function waitForPage(client: CDPConnection, options: { selector?: string; 
           matches = state === 'attached' ? nodes.length > 0 : state === 'detached' ? nodes.length === 0 :
             state === 'hidden' ? shown.length === 0 : shown.some(el => ${Boolean(options.target)} ? !disabled(el) : true);
         }
-        // visibleText only rewrites whitespace, so every whitespace-free piece of the target must
-        // already be in textContent: a ~100x cheaper test that rejects most polls before the full scan.
+        // Cheap prefilter: visibleText only rewrites whitespace.
         if (text !== undefined) {
           const raw = document.body?.textContent ?? '';
           matches = matches && !!document.body && text.split(/\s+/).every(part => raw.includes(part)) &&
@@ -501,8 +489,7 @@ async function pressAt(client: CDPConnection, x: number, y: number, signal?: Abo
   aborted(signal);
 }
 
-// US-layout virtual key codes. charCodeAt() is wrong for punctuation: "." is 46 (Delete),
-// "'" is 39 (ArrowRight), "%" is 37 (ArrowLeft), etc., which page key handlers would misread.
+// US layout; charCodeAt() would map "." to Delete and "'" to ArrowRight.
 const PUNCTUATION: Record<string, [code: string, keyCode: number]> = {
   "`": ["Backquote", 192], "~": ["Backquote", 192], "-": ["Minus", 189], "_": ["Minus", 189], "=": ["Equal", 187], "+": ["Equal", 187],
   "[": ["BracketLeft", 219], "{": ["BracketLeft", 219], "]": ["BracketRight", 221], "}": ["BracketRight", 221],
@@ -538,7 +525,6 @@ function keyDefinition(chord: string) {
   }
   let definition = KEYS[key] ?? ([...key].length === 1 ? characterKey(key) : undefined);
   if (!definition) throw new Error(`Unsupported key: ${key}`);
-  // Shift+a should type "A", as on a real keyboard.
   if (modifiers & 8 && /^[a-z]$/.test(definition.key)) definition = { ...definition, key: definition.key.toUpperCase(), text: definition.key.toUpperCase() };
   return { key: definition.key, code: definition.code, windowsVirtualKeyCode: definition.keyCode,
     nativeVirtualKeyCode: definition.keyCode, modifiers,
@@ -616,9 +602,7 @@ async function listTargets(signal?: AbortSignal): Promise<Page[]> {
   return await response.json() as Page[];
 }
 
-// ---- Automatic human-verification checkbox ----
-// Only the single "I am human" checkbox of these widgets is clicked. Image/puzzle challenges,
-// sliders and other CAPTCHAs are left to the user via noVNC. Set PI_CHROMIUM_AUTO_VERIFY=0 to disable.
+// Only the "I am human" checkbox is automated; puzzles go to noVNC. PI_CHROMIUM_AUTO_VERIFY=0 disables.
 const CAPTCHA = "CAPTCHA or human verification";
 const AUTO_VERIFY = process.env.PI_CHROMIUM_AUTO_VERIFY !== "0";
 const VERIFY_TIMEOUT_MS = 25_000;
@@ -643,7 +627,7 @@ function attr(node: DomNode, name: string) {
   for (let i = 0; i < list.length; i += 2) if (list[i] === name) return list[i + 1];
   return undefined;
 }
-/** Light DOM, every shadow root (closed ones too, via pierce) and same-process frame documents. */
+/** Light DOM, all shadow roots and same-process frames. */
 function collect(root: DomNode, match: (node: DomNode) => boolean) {
   const found: DomNode[] = [], parents = new Map<DomNode, DomNode>(), stack = [root];
   while (stack.length) {
@@ -664,11 +648,10 @@ async function boxOf(client: CDPConnection, nodeId: number, signal: AbortSignal,
     return box.width >= 8 && box.height >= 8 ? box : undefined;
   } catch { aborted(signal); return undefined; } // Not rendered (yet).
 }
-/** Finds the checkbox in a widget document; its box is relative to that document's frame viewport. */
 async function checkboxIn(client: CDPConnection, root: DomNode, widget: Widget, signal: AbortSignal) {
   const { found, parents } = collect(root, widget.checkbox);
   for (const node of found) {
-    // A styled checkbox may hide the <input> itself; fall back to its label/wrapper.
+    // A styled checkbox may hide the <input>; try its label.
     for (let current: DomNode | undefined = node, depth = 0; current && depth < 3; current = parents.get(current), depth++) {
       if (current.nodeName === "#document-fragment") break;
       const box = await boxOf(client, current.nodeId, signal);
@@ -696,11 +679,10 @@ async function findCheckbox(client: CDPConnection, signal: AbortSignal): Promise
       if (!frameBox) continue;
       let found: { box: Box; checked: boolean } | undefined, inspected = false;
       if (frame.contentDocument) {
-        // Same-process frame: box coordinates are already relative to the main viewport.
         inspected = true;
         found = await checkboxIn(client, frame.contentDocument, widget, signal);
       } else {
-        // Cross-origin frame in its own process: inspect it through its own target.
+        // Out-of-process frame: inspect it through its own target.
         targets ??= await listTargets(signal).catch(() => { aborted(signal); return []; });
         const target = targets.find(item => item.id === frame.frameId && item.webSocketDebuggerUrl);
         if (target) {
@@ -714,8 +696,7 @@ async function findCheckbox(client: CDPConnection, signal: AbortSignal): Promise
           } catch { aborted(signal); } finally { child.close(); }
         }
       }
-      // Fixed offset only when the frame could not be inspected at all and has the standard
-      // (non-compact) layout; an inspected frame without a visible checkbox is still loading.
+      // Fixed offset only if the frame could not be inspected at all.
       const spot = found ? { x: found.box.left + found.box.width / 2, y: found.box.top + found.box.height / 2, checked: found.checked } :
         !inspected && frameBox.width >= 290 && frameBox.height <= 90 ? { x: frameBox.left + widget.fallbackX, y: frameBox.top + frameBox.height / 2, checked: false } : undefined;
       if (!spot) continue;
@@ -725,7 +706,7 @@ async function findCheckbox(client: CDPConnection, signal: AbortSignal): Promise
     }
     return { seen };
   } finally {
-    // getDocument implicitly enables the DOM agent; stop its event stream again.
+    // getDocument implicitly enabled the DOM agent.
     if (client.open) await client.send("DOM.disable", {}, undefined, 1500).catch(() => {});
   }
 }
@@ -757,7 +738,6 @@ export async function autoVerify(client: CDPConnection, signal: AbortSignal): Pr
     const state = await captchaState(client, signal);
     if (!state.captcha) return { passed: true, clicks, message: clicks ? `passed after clicking the ${widget} checkbox` : "verification cleared without a click" };
     if (state.puzzle) return { passed: false, clicks, message: `${clickedPrefix()}an image/puzzle challenge is showing; solve it manually` };
-    // Give a clicked widget time to verify before one retry.
     if (clicks < 2 && Date.now() - lastClick > 7000) {
       let found: Awaited<ReturnType<typeof findCheckbox>> = { seen: false };
       try { found = await findCheckbox(client, signal); }
@@ -867,7 +847,7 @@ async function executeStep(client: CDPConnection, step: Step, signal: AbortSigna
   let result = "";
   if (step.action === "open") {
     await client.send("Page.bringToFront", {}, signal);
-    // A same-document navigation (hash change) keeps the old watcher; restart its quiet window.
+    // A hash-only navigation keeps the old watcher.
     await evaluate(client, js("probe(true); return true"), signal).catch(error => { aborted(signal); if (!contextChanged(error)) throw error; });
     const navigation = await client.send("Page.navigate", { url: step.target }, signal, Math.max(1000, timeout));
     if (navigation.errorText) throw new Error(`Navigation failed: ${navigation.errorText}`);
@@ -878,7 +858,7 @@ async function executeStep(client: CDPConnection, step: Step, signal: AbortSigna
   if (step.action === "fill") result = await fill(client, step.selector!, step.text!, signal);
   if (step.action === "press") result = await press(client, step.selector, step.key!, signal);
   if (step.action === "scroll") {
-    // Many app layouts scroll an inner container while the window itself cannot move.
+    // Fall back to an inner scroll container.
     const position = await evaluate<{ target: string; x: number; y: number }>(client, js(`
       probe(true);
       const delta = ${step.deltaY ?? 600}, before = scrollY;
@@ -886,7 +866,6 @@ async function executeStep(client: CDPConnection, step: Step, signal: AbortSigna
       if (scrollY !== before || !delta) return { target: 'page', x: scrollX, y: scrollY };
       const scrollable = el => el.scrollHeight > el.clientHeight && /(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY) && visible(el);
       const chain = start => { const out = []; for (let el = start; el && el !== document.documentElement; el = el.parentElement) out.push(el); return out; };
-      // Prefer the focused element's container, then the one under the viewport centre, then the largest.
       const area = el => { const r = el.getBoundingClientRect(); return Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0)) * Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0)); };
       const rest = Array.from(document.body?.querySelectorAll('*') ?? []).slice(0, 8000).filter(scrollable).sort((a, b) => area(b) - area(a));
       for (const el of [...chain(document.activeElement), ...chain(document.elementFromPoint(innerWidth / 2, innerHeight / 2)), ...rest]) {
@@ -937,7 +916,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "chromium", label: "Termux Chromium",
     // No active-only promptSnippet/promptGuidelines: keep the system prefix stable.
-    description: "Control persistent Chromium for real interactive browser tasks, not ordinary search/retrieval. open/click/fill/press/scroll/wait/check return filtered rendered text and exact @refs including menu items, with open menus prioritized; do not immediately call read again. Text is not a pixel/occlusion guarantee: use screenshot to verify visual claims. Failures include fresh page refs, so use those instead of guessing selectors; missing CSS interaction targets default to 3s (override timeoutMs). Screenshot returns an image preview by default; path chooses a PNG file, gallery saves to Android DCIM/Screenshots with a bounded best-effort scan. Use returned @refs or unique CSS selectors. Set waitFor/waitText on the action for asynchronous results; wait without a condition waits for brief DOM stability, NOT a fixed sleep. Use batch for known dependent steps (one final page); never issue dependent calls in parallel. Batch stops at errors or manual gates; never blindly replay successful steps. A human-verification checkbox (Cloudflare Turnstile, reCAPTCHA, hCaptcha) is clicked automatically once per non-read call; image/puzzle CAPTCHAs, passwords, MFA and consent require manual noVNC handling; check retries the checkbox or resumes afterwards. tabs/switch handle popups explicitly. Main-document DOM only. Use screenshot only when requested or DOM information is insufficient.",
+    description: "Control persistent Chromium for real interactive browser tasks, not ordinary search/retrieval. open/click/fill/press/scroll/wait/check return filtered rendered text and exact @refs including menu items, with open menus prioritized; do not immediately call read again. Text is not a pixel/occlusion guarantee: use screenshot to verify visual claims. Failures include fresh page refs, so use those instead of guessing selectors; missing CSS interaction targets default to 3s (override timeoutMs). Screenshot returns an image preview by default; path chooses a PNG file, gallery saves to Android DCIM/Screenshots with a bounded best-effort scan. Use returned @refs or unique CSS selectors. Set waitFor/waitText on the action for asynchronous results; wait without a condition waits for brief DOM stability, NOT a fixed sleep. Use batch for known dependent steps (one final page); never issue dependent calls in parallel. Batch stops at errors or manual gates; never blindly replay successful steps. Verification checkboxes are clicked automatically; image CAPTCHAs, passwords, MFA and consent require manual noVNC handling; check resumes afterwards. tabs/switch handle popups explicitly. Main-document DOM only. Use screenshot only when requested or DOM information is insufficient.",
     parameters,
     async execute(_id, input, signal, onUpdate, ctx) {
       const params = input as Params;
@@ -973,9 +952,9 @@ export default function (pi: ExtensionAPI) {
         }
         const completed: string[] = [], verifyNotes: string[] = [];
         let data: Snapshot | undefined, stopped = false, verifyTried = false;
-        // Same rule as the in-page guard: a login form alone does not block non-sensitive steps.
+        // Same rule as guard(): a login form alone does not block.
         const blocked = (page?: Snapshot) => !!page?.reasons.some(reason => reason !== "login");
-        // At most one automatic attempt per call, so a failing widget cannot loop.
+        // One attempt per call.
         const autoPass = async (page: Snapshot) => {
           if (!AUTO_VERIFY || verifyTried || !page.reasons.includes(CAPTCHA)) return false;
           verifyTried = true;
@@ -1002,8 +981,7 @@ export default function (pi: ExtensionAPI) {
             let message: string;
             try { message = await executeStep(client, step, activeSignal); }
             catch (error) {
-              // The guard refuses before any input is sent, so a step blocked only by a checkbox
-              // can run once more after it passes; no pre-check costs every action a round trip.
+              // guard() throws before any input, so one retry is safe.
               aborted(activeSignal);
               if (!/Manual user action required/.test(String(error)) || !String(error).includes(CAPTCHA) ||
                 !await autoPass(await inspect(client, undefined, 0, 0, activeSignal))) throw error;
@@ -1029,7 +1007,7 @@ export default function (pi: ExtensionAPI) {
         const maxChars = params.report === "status" ? 0 : params.maxChars ?? 2500;
         const maxElements = params.report === "status" ? 0 : params.maxElements ?? 24;
         data = await inspect(client, root, maxChars, maxElements, activeSignal);
-        // A plain read never interacts with the page; every other action may pass a checkbox gate.
+        // read never interacts with the page.
         if (!["read", "tabs", "switch"].includes(params.action) && await autoPass(data)) {
           data = await inspect(client, root, maxChars, maxElements, activeSignal);
         }
