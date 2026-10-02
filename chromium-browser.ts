@@ -218,23 +218,45 @@ const DOM = String.raw`
     prefix: Math.random().toString(36).slice(2, 10), next: 0, refs: new Map(), ids: new WeakMap()
   };
   // DOM presence/innerText alone is not evidence of a currently displayed panel.
-  const suppressed = el => {
-    if (el.closest('[inert],[aria-hidden="true"]')) return true;
-    for (let p = el; p; p = p.parentElement) {
-      const s = getComputedStyle(p);
-      if (s.display === 'none' || s.contentVisibility === 'hidden' || Number(s.opacity) === 0) return true;
+  // Ancestor results are cached for this one evaluation (the prelude runs fresh per call), so each
+  // element's style is read once instead of once per descendant text node. Callers that scroll
+  // must not reuse visible() results from before the scroll.
+  const hiddenCache = new Map(), clipCache = new Map();
+  const hiddenTree = el => {
+    if (!el) return false;
+    let hidden = hiddenCache.get(el);
+    if (hidden === undefined) {
+      const s = getComputedStyle(el);
+      hidden = el.matches('[inert],[aria-hidden="true"]') || s.display === 'none' || s.contentVisibility === 'hidden' ||
+        Number(s.opacity) === 0 || hiddenTree(el.parentElement);
+      hiddenCache.set(el, hidden);
     }
+    return hidden;
+  };
+  const suppressed = el => {
+    if (hiddenTree(el)) return true;
     const s = getComputedStyle(el);
     return s.visibility === 'hidden' || s.visibility === 'collapse';
   };
-  const unclipped = (rect, parent) => {
-    let { left, right, top, bottom } = rect;
-    for (let p = parent; p; p = p.parentElement) {
-      const s = getComputedStyle(p), r = p.getBoundingClientRect();
-      if (/(hidden|clip|scroll|auto)/.test(s.overflowX)) { left = Math.max(left, r.left); right = Math.min(right, r.right); }
-      if (/(hidden|clip|scroll|auto)/.test(s.overflowY)) { top = Math.max(top, r.top); bottom = Math.min(bottom, r.bottom); }
+  // The viewport area left to an element's content after every ancestor's overflow clipping.
+  const clipOf = el => {
+    if (!el) return { left: -Infinity, top: -Infinity, right: Infinity, bottom: Infinity };
+    let clip = clipCache.get(el);
+    if (!clip) {
+      const s = getComputedStyle(el), clipX = /(hidden|clip|scroll|auto)/.test(s.overflowX), clipY = /(hidden|clip|scroll|auto)/.test(s.overflowY);
+      clip = { ...clipOf(el.parentElement) };
+      if (clipX || clipY) {
+        const r = el.getBoundingClientRect();
+        if (clipX) { clip.left = Math.max(clip.left, r.left); clip.right = Math.min(clip.right, r.right); }
+        if (clipY) { clip.top = Math.max(clip.top, r.top); clip.bottom = Math.min(clip.bottom, r.bottom); }
+      }
+      clipCache.set(el, clip);
     }
-    return right > left && bottom > top;
+    return clip;
+  };
+  const unclipped = (rect, parent) => {
+    const clip = clipOf(parent);
+    return Math.min(rect.right, clip.right) > Math.max(rect.left, clip.left) && Math.min(rect.bottom, clip.bottom) > Math.max(rect.top, clip.top);
   };
   const visible = el => el instanceof Element && !suppressed(el) &&
     Array.from(el.getClientRects()).some(r => unclipped(r, el.parentElement));
@@ -334,17 +356,35 @@ const DOM = String.raw`
     const reasons = reasonsFor();
     if (reasons.some(r => r !== 'login')) throw new Error('Manual user action required: ' + reasons.join(', ') + '. Use check to retry automatic verification or open noVNC.');
   };
-  const probe = () => {
+  // probe(true) marks the start of an action: quiet time is measured from it, so an effect that
+  // lands a few ms after the click is not missed because the page had been quiet before.
+  const probe = (action = false) => {
     let watch = store.watch;
     if (!watch) {
-      watch = store.watch = { changed: Date.now(), touched: Date.now() };
-      watch.observer = new MutationObserver(() => { watch.changed = Date.now(); });
+      watch = store.watch = { changed: Date.now(), touched: Date.now(), nodes: new WeakMap() };
+      watch.observer = new MutationObserver(records => {
+        const now = Date.now();
+        for (const record of records) {
+          const target = record.type === 'characterData' ? record.target.parentNode : record.target;
+          let node = watch.nodes.get(target);
+          if (!node) watch.nodes.set(target, node = { count: 0, first: now });
+          // A node that keeps rewriting itself (clock, ticker) is background noise once it has changed
+          // a few times, if it was already doing so before the current action (or there was none since
+          // load); otherwise such pages never settle. A spinner started by the action and newly added
+          // elements always count as progress.
+          const noise = node.count++ >= 3 && (watch.action === undefined || node.first < watch.action) &&
+            !Array.from(record.addedNodes).some(added => added.nodeType === Node.ELEMENT_NODE);
+          if (!noise) watch.changed = now;
+        }
+      });
       watch.observer.observe(document, { childList: true, subtree: true, attributes: true, characterData: true });
-      // Self-cleanup even if the host cancels, disconnects or the tab becomes inactive.
+      // Kept between calls so background noise is already known at the next action; disconnects itself
+      // after 15s idle even if the host cancels, disconnects or the tab becomes inactive.
       watch.timer = setInterval(() => {
-        if (Date.now() - watch.touched > 1500) { watch.observer.disconnect(); clearInterval(watch.timer); if (store.watch === watch) delete store.watch; }
-      }, 500);
+        if (Date.now() - watch.touched > 15000) { watch.observer.disconnect(); clearInterval(watch.timer); if (store.watch === watch) delete store.watch; }
+      }, 1000);
     }
+    if (action) watch.changed = watch.action = Date.now();
     watch.touched = Date.now();
     return Date.now() - watch.changed;
   };
@@ -364,9 +404,10 @@ async function snapshot(client: CDPConnection, selector: string | undefined, max
     const overlay = el => !!el.closest('[role="menu"],[role="listbox"],[role="dialog"],[aria-modal="true"],[popover]:popover-open');
     candidates.sort((a, b) => Number(overlay(b)) - Number(overlay(a)));
     for (const el of candidates) {
-      if (!visible(el)) continue;
+      // The cheap viewport test first: most links on a long page are off-screen.
       const rect = el.getBoundingClientRect();
       if (!${Boolean(selector)} && (rect.bottom <= 0 || rect.right <= 0 || rect.top >= innerHeight || rect.left >= innerWidth)) continue;
+      if (!visible(el)) continue;
       const secret = sensitive(el);
       elements.push({ ref: refFor(el), selector: semanticSelector(el), tag: el.tagName.toLowerCase(),
         name: secret ? '[sensitive field]' : nameFor(el), type: el instanceof HTMLInputElement ? el.type : undefined,
@@ -409,7 +450,13 @@ async function waitForPage(client: CDPConnection, options: { selector?: string; 
           matches = state === 'attached' ? nodes.length > 0 : state === 'detached' ? nodes.length === 0 :
             state === 'hidden' ? shown.length === 0 : shown.some(el => ${Boolean(options.target)} ? !disabled(el) : true);
         }
-        if (text !== undefined) matches = matches && !!document.body && visibleText(document.body, 200000).includes(text);
+        // visibleText only rewrites whitespace, so every whitespace-free piece of the target must
+        // already be in textContent: a ~100x cheaper test that rejects most polls before the full scan.
+        if (text !== undefined) {
+          const raw = document.body?.textContent ?? '';
+          matches = matches && !!document.body && text.split(/\s+/).every(part => raw.includes(part)) &&
+            visibleText(document.body, 200000).includes(text);
+        }
         return { done: ${explicit} ? matches : document.readyState !== 'loading' && quiet >= 160 };
       `), signal, Math.max(100, Math.min(3000, until - Date.now())));
       if (result.done) return true;
@@ -423,7 +470,7 @@ async function waitForPage(client: CDPConnection, options: { selector?: string; 
 
 async function click(client: CDPConnection, selector: string, signal?: AbortSignal) {
   const point = await evaluate<{ x: number; y: number; tag: string }>(client, js(`
-    const el = find(${JSON.stringify(selector)}); guard(el); probe();
+    const el = find(${JSON.stringify(selector)}); guard(el); probe(true);
     el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
     const rects = Array.from(el.getClientRects());
     for (const r of rects) {
@@ -515,7 +562,7 @@ async function dispatchKey(client: CDPConnection, chord: string, signal?: AbortS
 }
 async function fill(client: CDPConnection, selector: string, text: string, signal?: AbortSignal) {
   const prepared = await evaluate<{ mode: string; ref: string }>(client, js(`
-    const el = find(${JSON.stringify(selector)}); guard(el); probe();
+    const el = find(${JSON.stringify(selector)}); guard(el); probe(true);
     el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); el.focus();
     if (document.activeElement !== el) throw new Error('Element could not receive focus.');
     const value = ${JSON.stringify(text)};
@@ -552,7 +599,7 @@ async function fill(client: CDPConnection, selector: string, text: string, signa
 async function press(client: CDPConnection, selector: string | undefined, key: string, signal?: AbortSignal) {
   await evaluate(client, js(`
     const el = ${JSON.stringify(selector)} ? find(${JSON.stringify(selector)}) : document.activeElement;
-    guard(el); probe();
+    guard(el); probe(true);
     if (${Boolean(selector)}) {
       el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); el.focus();
       if (document.activeElement !== el) throw new Error('Element could not receive keyboard focus.');
@@ -820,6 +867,8 @@ async function executeStep(client: CDPConnection, step: Step, signal: AbortSigna
   let result = "";
   if (step.action === "open") {
     await client.send("Page.bringToFront", {}, signal);
+    // A same-document navigation (hash change) keeps the old watcher; restart its quiet window.
+    await evaluate(client, js("probe(true); return true"), signal).catch(error => { aborted(signal); if (!contextChanged(error)) throw error; });
     const navigation = await client.send("Page.navigate", { url: step.target }, signal, Math.max(1000, timeout));
     if (navigation.errorText) throw new Error(`Navigation failed: ${navigation.errorText}`);
     if (navigation.isDownload) return "Navigation started a download; inspect downloads separately.";
@@ -831,7 +880,7 @@ async function executeStep(client: CDPConnection, step: Step, signal: AbortSigna
   if (step.action === "scroll") {
     // Many app layouts scroll an inner container while the window itself cannot move.
     const position = await evaluate<{ target: string; x: number; y: number }>(client, js(`
-      probe();
+      probe(true);
       const delta = ${step.deltaY ?? 600}, before = scrollY;
       window.scrollBy({ top: delta, behavior: 'instant' });
       if (scrollY !== before || !delta) return { target: 'page', x: scrollX, y: scrollY };
@@ -943,14 +992,23 @@ export default function (pi: ExtensionAPI) {
         };
         for (let i = 0; i < steps.length; i++) {
           const step = steps[i], gated = !["open", "check", "read", "wait", "scroll"].includes(step.action);
-          // Later batch steps reuse the safety inspection performed after the preceding step.
-          if (i === 0 && (params.action === "batch" || gated)) data = await gate();
           if (params.action === "batch") {
+            // Later steps reuse the safety inspection performed after the preceding step.
+            if (i === 0) data = await gate();
             if (gated && blocked(data)) { stopped = true; break; }
             onUpdate?.({ content: [{ type: "text", text: `Browser step ${i + 1}/${steps.length}: ${step.action}` }], details: { completed: i, total: steps.length } });
           }
           try {
-            const message = await executeStep(client, step, activeSignal);
+            let message: string;
+            try { message = await executeStep(client, step, activeSignal); }
+            catch (error) {
+              // The guard refuses before any input is sent, so a step blocked only by a checkbox
+              // can run once more after it passes; no pre-check costs every action a round trip.
+              aborted(activeSignal);
+              if (!/Manual user action required/.test(String(error)) || !String(error).includes(CAPTCHA) ||
+                !await autoPass(await inspect(client, undefined, 0, 0, activeSignal))) throw error;
+              message = await executeStep(client, step, activeSignal);
+            }
             completed.push(`${i + 1}. ${step.action}: ${message}`);
           } catch (error) {
             aborted(activeSignal);
