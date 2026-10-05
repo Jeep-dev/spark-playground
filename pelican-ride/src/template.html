@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<title>鹈鹕骑行 · 加州 1 号公路</title>
+<style>
+  :root {
+    --glass: rgba(14, 22, 32, 0.52);
+    --glass-strong: rgba(10, 16, 24, 0.72);
+    --line: rgba(255, 255, 255, 0.14);
+    --fg: #f4f1ea;
+    --dim: rgba(244, 241, 234, 0.62);
+    --accent: #ffb04a;
+    --accent2: #3fd0c9;
+    --gutter: 16px;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #0a1220; overflow: hidden; }
+  body { font: 14px/1.4 -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Microsoft YaHei", "Segoe UI", sans-serif; color: var(--fg); user-select: none; -webkit-user-select: none; }
+  canvas#view { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; outline: none; }
+  .hud { position: fixed; pointer-events: none; z-index: 5; }
+  .glass { background: var(--glass); border: 1px solid var(--line); border-radius: 14px; backdrop-filter: blur(14px) saturate(1.3); -webkit-backdrop-filter: blur(14px) saturate(1.3); box-shadow: 0 6px 30px rgba(0,0,0,.25); }
+  button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; pointer-events: auto; }
+
+  /* 标题与地点 */
+  #title { top: max(var(--gutter), env(safe-area-inset-top)); left: var(--gutter); max-width: min(420px, calc(100vw - 2 * var(--gutter) - 170px)); padding: 12px 16px; }
+  #title h1 { margin: 0; font-size: 17px; font-weight: 700; letter-spacing: .04em; }
+  #title h1 em { font-style: normal; color: var(--accent); }
+  #title p { margin: 2px 0 0; font-size: 12px; color: var(--dim); }
+  #place { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); transition: opacity .5s; }
+  #place b { display: block; font-size: 22px; line-height: 1.15; font-weight: 700; text-shadow: 0 1px 12px rgba(0,0,0,.4); }
+  #place span { font-size: 12px; color: var(--dim); letter-spacing: .02em; }
+
+  /* 统计 */
+  #stats { top: max(var(--gutter), env(safe-area-inset-top)); right: var(--gutter); padding: 10px 14px; display: grid; grid-template-columns: repeat(2, auto); gap: 4px 18px; text-align: right; }
+  #stats div { display: flex; flex-direction: column; align-items: flex-end; }
+  #stats small { font-size: 10.5px; letter-spacing: .08em; color: var(--dim); text-transform: uppercase; }
+  #stats strong { font-size: 20px; font-variant-numeric: tabular-nums; font-weight: 600; line-height: 1.15; }
+  #stats strong i { font-style: normal; font-size: 11px; color: var(--dim); margin-left: 3px; font-weight: 400; }
+
+  /* 路线进度 */
+  #route { left: var(--gutter); right: var(--gutter); bottom: calc(max(var(--gutter), env(safe-area-inset-bottom)) + 74px); height: 34px; display: flex; align-items: center; pointer-events: none; }
+  #bar { position: relative; flex: 1; height: 4px; border-radius: 4px; background: rgba(255,255,255,.22); pointer-events: auto; cursor: pointer; }
+  #bar .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px; background: linear-gradient(90deg, var(--accent2), var(--accent)); width: 0%; }
+  #bar .dot { position: absolute; top: 50%; width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 50%; background: #fff; border: 3px solid var(--accent); box-shadow: 0 0 12px rgba(255,176,74,.9); left: 0%; }
+  #bar .tick { position: absolute; top: 50%; width: 9px; height: 9px; margin: -4.5px 0 0 -4.5px; border-radius: 50%; background: rgba(255,255,255,.75); border: 2px solid rgba(10,16,24,.7); cursor: pointer; pointer-events: auto; }
+  #bar .tick:hover, #bar .tick:focus-visible { background: var(--accent); outline: none; }
+  #bar .tick label { position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%); white-space: nowrap; font-size: 11px; background: var(--glass-strong); padding: 3px 7px; border-radius: 6px; opacity: 0; transition: opacity .15s; pointer-events: none; }
+  #bar .tick:hover label, #bar .tick:focus-visible label { opacity: 1; }
+
+  /* 视角栏 */
+  #dock { left: 50%; transform: translateX(-50%); bottom: max(var(--gutter), env(safe-area-inset-bottom)); display: flex; gap: 2px; padding: 5px; max-width: calc(100vw - 2 * var(--gutter)); overflow-x: auto; scrollbar-width: none; pointer-events: auto; }
+  #dock::-webkit-scrollbar { display: none; }
+  #dock button { flex: none; display: flex; flex-direction: column; align-items: center; gap: 2px; min-width: 62px; padding: 7px 8px 6px; border-radius: 10px; font-size: 12px; color: var(--dim); transition: background .15s, color .15s; }
+  #dock button svg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+  #dock button kbd { font: 10px/1 ui-monospace, monospace; opacity: .55; }
+  #dock button:hover { background: rgba(255,255,255,.08); color: var(--fg); }
+  #dock button.on { background: rgba(255,176,74,.18); color: var(--accent); box-shadow: inset 0 0 0 1px rgba(255,176,74,.5); }
+
+  /* 设置 */
+  #gear { right: var(--gutter); bottom: max(var(--gutter), env(safe-area-inset-bottom)); width: 46px; height: 46px; display: grid; place-items: center; border-radius: 50%; pointer-events: auto; cursor: pointer; }
+  #gear svg { width: 22px; height: 22px; stroke: var(--fg); fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+  #panel { right: var(--gutter); bottom: calc(max(var(--gutter), env(safe-area-inset-bottom)) + 56px); width: min(320px, calc(100vw - 2 * var(--gutter))); padding: 14px 16px 12px; display: none; pointer-events: auto; max-height: 70vh; overflow-y: auto; }
+  #panel.open { display: block; }
+  #panel h3 { margin: 0 0 8px; font-size: 12px; letter-spacing: .1em; color: var(--dim); font-weight: 600; }
+  .row { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+  .row > span { width: 64px; flex: none; font-size: 12.5px; color: var(--dim); }
+  .row output { width: 48px; text-align: right; font-variant-numeric: tabular-nums; font-size: 12.5px; }
+  input[type=range] { flex: 1; min-width: 0; accent-color: var(--accent); height: 22px; }
+  select { flex: 1; background: rgba(255,255,255,.08); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px; font: inherit; }
+  select option { color: #111; }
+  .switch { display: flex; align-items: center; justify-content: space-between; margin: 8px 0; font-size: 13px; }
+  .switch input { appearance: none; width: 38px; height: 22px; border-radius: 22px; background: rgba(255,255,255,.2); position: relative; cursor: pointer; transition: background .15s; flex: none; }
+  .switch input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: transform .15s; }
+  .switch input:checked { background: var(--accent); }
+  .switch input:checked::after { transform: translateX(16px); }
+  .btns { display: flex; gap: 8px; margin-top: 10px; }
+  .btns button { flex: 1; padding: 8px; border-radius: 10px; background: rgba(255,255,255,.09); border: 1px solid var(--line); font-size: 13px; }
+  .btns button:hover { background: rgba(255,255,255,.16); }
+  #panel hr { border: 0; border-top: 1px solid var(--line); margin: 12px 0 8px; }
+  .keys { font-size: 11.5px; color: var(--dim); line-height: 1.7; }
+  .keys b { color: var(--fg); font-weight: 600; font-family: ui-monospace, monospace; }
+
+  /* 提示 / 遮罩 */
+  #hint { left: 50%; top: 52%; transform: translate(-50%, 0); text-align: center; padding: 8px 16px; font-size: 13px; color: var(--fg); opacity: 0; transition: opacity .8s; width: max-content; max-width: min(520px, calc(100vw - 2 * var(--gutter))); }
+  #hint.show { opacity: 1; }
+  #toast { left: 50%; top: 96px; transform: translateX(-50%); padding: 6px 14px; font-size: 13px; opacity: 0; transition: opacity .3s; white-space: nowrap; }
+  #toast.show { opacity: 1; }
+  #fade { position: fixed; inset: 0; background: #05080d; opacity: 0; pointer-events: none; transition: opacity .45s; z-index: 8; }
+  #loading { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; background: radial-gradient(120% 90% at 50% 100%, #ff9d5c 0%, #c75b6a 28%, #2a2f5a 62%, #0a1220 100%); transition: opacity .8s; }
+  #loading.done { opacity: 0; pointer-events: none; }
+  #loading .box { text-align: center; padding: 0 24px; }
+  #loading h2 { margin: 0 0 6px; font-size: 28px; letter-spacing: .08em; text-shadow: 0 2px 20px rgba(0,0,0,.35); }
+  #loading p { margin: 0 0 22px; color: rgba(255,255,255,.8); font-size: 14px; }
+  #loading .meter { width: min(300px, 70vw); height: 4px; border-radius: 4px; background: rgba(255,255,255,.25); margin: 0 auto; overflow: hidden; }
+  #loading .meter i { display: block; height: 100%; width: 0%; background: #fff; transition: width .2s; }
+  #loading small { display: block; margin-top: 10px; color: rgba(255,255,255,.7); font-size: 12px; }
+  #fatal { position: fixed; inset: 0; z-index: 30; display: none; place-items: center; background: #0a1220; text-align: center; padding: 24px; }
+  #fatal.on { display: grid; }
+
+  body.hide-ui .hud, body.hide-ui #dock { opacity: 0; transition: opacity .3s; }
+  @media (max-width: 640px) {
+    #stats { grid-template-columns: repeat(2, auto); padding: 8px 10px; }
+    #stats strong { font-size: 16px; }
+    #title h1 { font-size: 15px; }
+    #place b { font-size: 18px; }
+    #route { bottom: calc(max(var(--gutter), env(safe-area-inset-bottom)) + 78px); right: calc(var(--gutter) + 56px); }
+    #dock { max-width: calc(100vw - 2 * var(--gutter) - 56px); left: var(--gutter); transform: none; }
+    #dock button { min-width: 54px; font-size: 11px; }
+  }
+  @media (prefers-reduced-motion: reduce) { #fade, #loading, #hint { transition: none; } }
+</style>
+</head>
+<body>
+<canvas id="view" tabindex="0"></canvas>
+
+<div id="title" class="hud glass">
+  <h1>鹈鹕骑行 <em>·</em> 加州 1 号公路</h1>
+  <p>Pacific Coast Highway · 旧金山 → 马里布</p>
+  <div id="place"><b id="placeName">金门大桥</b><span id="placeEn">Golden Gate Bridge</span></div>
+</div>
+
+<div id="stats" class="hud glass">
+  <div><small>速度</small><strong id="vSpeed">0<i>km/h</i></strong></div>
+  <div><small>时间</small><strong id="vClock">15:00</strong></div>
+  <div><small>里程</small><strong id="vDist">0.0<i>km</i></strong></div>
+  <div><small>太阳高度</small><strong id="vSun">0<i>°</i></strong></div>
+</div>
+
+<div id="route" class="hud"><div id="bar"><div class="fill" id="barFill"></div><div class="dot" id="barDot"></div></div></div>
+
+<div id="dock" class="hud glass" role="toolbar" aria-label="视角"></div>
+
+<button id="gear" class="hud glass" aria-label="设置" title="设置">
+  <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+</button>
+
+<div id="panel" class="hud glass">
+  <h3>时间与光照</h3>
+  <div class="row"><span>时刻</span><input id="inHour" type="range" min="5.5" max="19.2" step="0.01" value="15"><output id="outHour">15:00</output></div>
+  <label class="switch"><span>时间随旅程推进(午后 → 日落)</span><input id="inJourney" type="checkbox" checked></label>
+  <h3 style="margin-top:14px">骑行</h3>
+  <div class="row"><span>巡航速度</span><input id="inSpeed" type="range" min="0" max="30" step="0.5" value="8"><output id="outSpeed">29 km/h</output></div>
+  <label class="switch"><span>暂停</span><input id="inPause" type="checkbox"></label>
+  <h3 style="margin-top:14px">画质</h3>
+  <div class="row"><span>预设</span><select id="inQuality"><option value="auto">自动</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option></select></div>
+  <label class="switch"><span>实时阴影</span><input id="inShadow" type="checkbox" checked></label>
+  <label class="switch"><span>泛光 / 太阳光晕</span><input id="inBloom" type="checkbox" checked></label>
+  <label class="switch"><span>环境音(海浪 / 风)</span><input id="inAudio" type="checkbox" checked></label>
+  <div class="btns"><button id="btnShot">截图</button><button id="btnFull">全屏</button><button id="btnHide">隐藏界面 (H)</button></div>
+  <hr>
+  <div class="keys"><b>1–9</b> 切换视角 &nbsp; <b>C</b> 下一个视角<br><b>↑/↓</b> 加减速 &nbsp; <b>空格</b> 暂停 &nbsp; <b>T</b> 时间推进 &nbsp; <b>B</b> 车铃<br>环绕/自由视角:拖动旋转、滚轮缩放、右键平移;自由飞行 <b>WASD</b>/<b>QE</b>/<b>Shift</b></div>
+</div>
+
+<div id="hint" class="hud glass">拖动画面旋转视角 · 滚轮缩放 · 数字键 1–9 切换机位</div>
+<div id="toast" class="hud glass"></div>
+<div id="fade"></div>
+<div id="loading"><div class="box"><h2>鹈鹕骑行</h2><p>正在铺设加州 1 号公路……</p><div class="meter"><i id="loadBar"></i></div><small id="loadText">生成地形</small></div></div>
+<div id="fatal"><div><h2>无法启动 3D 场景</h2><p id="fatalMsg">需要支持 WebGL 2 的浏览器。</p></div></div>
+
+<script>/*__BUNDLE__*/</script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+{
+  "name": "pelican-ride",
+  "version": "1.0.0",
+  "private": true,
+  "description": "鹈鹕骑自行车沿加州1号公路 — three.js 3D 场景",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "dev": "node build.mjs --watch"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "three": "^0.186.1"
+  }
+}
