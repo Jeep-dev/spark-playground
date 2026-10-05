@@ -140,7 +140,7 @@ export class CameraRig {
       case 'side': {
         const lat = (st.sideLat || 5.6) * this.sideSign;
         out.pos.copy(F).addScaledVector(r, lat).addScaledVector(f, 1.2 * Math.sin(t * 0.35));
-        out.pos.y = st.roadY + 1.15 + 0.2 * Math.sin(t * 0.3);
+        out.pos.y = st.roadY + 1.15 + (st.sideH || 0) + 0.2 * Math.sin(t * 0.3);
         out.look.copy(F).addScaledVector(f, 0.3);
         out.look.y = st.roadY + 1.2;
         out.fov = 38;

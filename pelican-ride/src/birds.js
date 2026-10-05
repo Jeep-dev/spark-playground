@@ -180,7 +180,10 @@ export class Birds {
     const v = clamp(speed * 1.0 + (target - this.flockS) * 0.4, 5, 18);
     this.flockS += v * dt;
     if (Math.abs(this.flockS - target) > 500) this.flockS = target;
-    const lat = 46 + 14 * Math.sin(T * 0.05 + 1.0);
+    const zf = getZone(clamp(this.flockS, 0, L - 1), zT);
+    const latT = clamp(zf.edge + zf.cliffW * 0.5 + 32, 55, 190);
+    this.lat = this.lat === undefined ? latT : damp(this.lat, latT, 0.6, dt);
+    const lat = this.lat + 12 * Math.sin(T * 0.05 + 1.0);
     const alt = 7 + 3 * Math.sin(T * 0.09);
     const vv = new THREE.Vector3();
     this.pelicans.forEach((b, i) => {
@@ -206,7 +209,8 @@ export class Birds {
     this.gulls.forEach((b, i) => {
       const c = b.userData.c;
       const a = c.a0 + T * c.w;
-      const sC = s + c.ds, dC = c.dd;
+      const zg = getZone(clamp(s + c.ds, 0, L - 1), zT);
+      const sC = s + c.ds, dC = zg.edge + 6 + c.dd * 0.55;
       const ss = sC + Math.cos(a) * c.r * 1.2, dd = dC + Math.sin(a) * c.r;
       const r = sampleRoute(clamp(ss, 0, L - 1));
       const x = r.x - r.cosp * dd, z = r.z + r.sinp * dd;

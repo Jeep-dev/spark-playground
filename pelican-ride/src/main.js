@@ -114,7 +114,16 @@ function applyQuality(name) {
   buildComposer();
 }
 
-addEventListener('resize', () => buildComposer());
+let resizeT = 0;
+addEventListener('resize', () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => buildComposer(), 120);
+});
+document.addEventListener('visibilitychange', () => {
+  if (!audio.ctx) return;
+  if (document.hidden) audio.ctx.suspend(); else if (audio.enabled) audio.ctx.resume();
+  last = performance.now();
+});
 
 // ---------------------------------------------------------------- 骑行/镜头
 const audio = new Ambience();
@@ -182,7 +191,10 @@ function placeRider(dt) {
   frame.focus.set(0, 1.15, 0.0);
   rider.bike.localToWorld(frame.focus);
   frame.roadY = r.e;
-  frame.sideLat = (st.s > R.LANDMARKS.ggb.s0 - 40 && st.s < R.LANDMARKS.ggb.s1 + 40) ? 13.5 : 5.6;
+  const onGGB = st.s > R.LANDMARKS.ggb.s0 - 40 && st.s < R.LANDMARKS.ggb.s1 + 40;
+  const onBixby = st.s > 3850 && st.s < 4260;
+  frame.sideLat = onGGB ? 13.5 : onBixby ? 8.5 : 5.6;
+  frame.sideH = onBixby ? 3.2 : 0;
   frame.speed = st.speed;
   return { kappa: r.kappa, e: r.e, phi: r.phi };
 }
@@ -316,7 +328,7 @@ async function boot() {
   ui.loaded();
   ui.hint('拖动画面旋转视角(环绕模式) · 数字键 1–9 切换机位 · ⚙ 调整时间与画质');
   window.__pelican = {
-    ready: true, st, atm, cams, rider, terrain, camera, renderer, scene, R,
+    ready: true, st, atm, cams, rider, terrain, camera, renderer, scene, R, birds, props, grass, landmarks, farTerrain,
     setS: (s) => jumpTo(s), setHour: (h) => { ui.setJourney(false); ui.state.hour = h; st.hour = h; ui.setHourSlider(h); },
     stepN: (n, dt = 0.033) => { for (let i = 0; i < n; i++) step(dt); },
     render: () => composer.render(),

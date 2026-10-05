@@ -30,7 +30,7 @@ const P = {
 };
 
 const c1 = [0, 0, 0], c2 = [0, 0, 0];
-export function terrainColor(out, s, d, h, ny, z) {
+export function terrainColor(out, s, d, h, ny, z, far = false) {
   const ad = Math.abs(d);
   const n1 = fbm(s * 0.006, d * 0.006, 3, 51);
   const n2 = noise2(s * 0.04, d * 0.04, 52);
@@ -47,7 +47,7 @@ export function terrainColor(out, s, d, h, ny, z) {
   // 岩石:陡坡
   const steep = smoothstep(0.9, 0.62, ny);
   if (steep > 0) {
-    const strata = 0.5 + 0.5 * Math.sin(h * 0.9 + n1 * 6);
+    const strata = 0.5 + 0.5 * Math.sin(h * (far ? 0.05 : 0.9) + n1 * 6);
     mix3(P.rock, P.rock2, strata * 0.7 + n2 * 0.3, c1);
     mix3(out, c1, steep, out);
   }
@@ -564,7 +564,7 @@ export class FarTerrain {
           const nl = Math.hypot(nx, ny, nz);
           nx /= nl; ny /= nl; nz /= nl;
           nor[k * 3] = nx; nor[k * 3 + 1] = ny; nor[k * 3 + 2] = nz;
-          terrainColor(this.c3, v.s, v.d, v.h, ny, getZone(v.s, this.zone));
+          terrainColor(this.c3, v.s, v.d, v.h, ny, getZone(v.s, this.zone), true);
           col[k * 3] = this.c3[0]; col[k * 3 + 1] = this.c3[1]; col[k * 3 + 2] = this.c3[2];
         }
       }

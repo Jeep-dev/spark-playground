@@ -83,7 +83,7 @@
   .keys b { color: var(--fg); font-weight: 600; font-family: ui-monospace, monospace; }
 
   /* 提示 / 遮罩 */
-  #hint { left: 50%; top: 52%; transform: translate(-50%, 0); text-align: center; padding: 8px 16px; font-size: 13px; color: var(--fg); opacity: 0; transition: opacity .8s; width: max-content; max-width: min(520px, calc(100vw - 2 * var(--gutter))); }
+  #hint { left: 50%; bottom: calc(max(var(--gutter), env(safe-area-inset-bottom)) + 124px); transform: translate(-50%, 0); text-align: center; padding: 8px 16px; font-size: 13px; color: var(--fg); opacity: 0; transition: opacity .8s; width: max-content; max-width: min(520px, calc(100vw - 2 * var(--gutter))); }
   #hint.show { opacity: 1; }
   #toast { left: 50%; top: 96px; transform: translateX(-50%); padding: 6px 14px; font-size: 13px; opacity: 0; transition: opacity .3s; white-space: nowrap; }
   #toast.show { opacity: 1; }

@@ -103,8 +103,8 @@ function build(list) {
 
 const Cs = {
   cyp: hex(0x24472a), cypHi: hex(0x4f7a3a),
-  pine: hex(0x16301f), pineHi: hex(0x2f5a32),
-  oak: hex(0x2e4a22), oakHi: hex(0x5a7a34),
+  pine: hex(0x1e4126), pineHi: hex(0x3d6c3a),
+  oak: hex(0x38572a), oakHi: hex(0x68893a),
   shrub: hex(0x4a5a2c), shrubHi: hex(0x8a8a46),
   sage: hex(0x5d6d4a), sageHi: hex(0xa4a67c),
   trunk: hex(0x3a2c20), redwood: hex(0x4e2e20), palmTrunk: hex(0x7d6a4e),
@@ -265,6 +265,7 @@ export class Props {
           float ln = n3(vWPt * 2.6) * 0.5 + n3(vWPt * 7.5) * 0.3 + n3(vWPt * 19.0) * 0.2;
           diffuseColor.rgb *= 0.55 + 0.95 * ln;
         }`,
+      fsAfterLights: 'reflectedLight.indirectDiffuse += diffuseColor.rgb * 0.7 * (1.0 - uNight);',
       vsAfterBegin: `
         {
           vec4 wpt = vec4(transformed, 1.0);

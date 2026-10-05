@@ -68,6 +68,43 @@ export const fmtHour = (h) => {
   return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
 };
 
+
+// ------------------------------------------------------------------ CPU 版 Preetham 天空辐亮度(与 three Sky.js 着色器一致,不含云)
+const TOTAL_RAYLEIGH = [5.804542996261093e-6, 1.3562911419845635e-5, 3.0265902468824876e-5];
+const MIE_CONST = [1.8399918514433978e14, 2.7798023919660528e14, 4.0790479543861094e14];
+function skySunIntensity(zc) {
+  zc = clamp(zc, -1, 1);
+  return 1000 * Math.max(0, 1 - Math.exp(-((1.6110731556870734 - Math.acos(zc)) / 1.5)));
+}
+export function skyRadiance(dx, dy, dz, sun, p, out) {
+  const l = Math.hypot(dx, dy, dz);
+  dx /= l; dy /= l; dz /= l;
+  const sl = Math.hypot(sun.x, sun.y, sun.z);
+  const sx = sun.x / sl, sy = sun.y / sl, sz = sun.z / sl;
+  const sunE = skySunIntensity(sy);
+  const cMie = 0.2 * p.turbidity * 10e-18;
+  const betaR = TOTAL_RAYLEIGH.map((v) => v * p.rayleigh);
+  const betaM = MIE_CONST.map((v) => 0.434 * cMie * v * p.mie);
+  const zen = Math.acos(Math.max(0, dy));
+  const inv = 1 / (Math.cos(zen) + 0.15 * Math.pow(93.885 - (zen * 180) / Math.PI, -1.253));
+  const sR = 8400 * inv, sM = 1250 * inv;
+  const cosT = dx * sx + dy * sy + dz * sz;
+  const rPhase = (3 / (16 * Math.PI)) * (1 + Math.pow(cosT * 0.5 + 0.5, 2));
+  const g = p.g, g2 = g * g;
+  const mPhase = (1 / (4 * Math.PI)) * ((1 - g2) / Math.pow(1 - 2 * g * cosT + g2, 1.5));
+  const mixk = clamp(Math.pow(1 - sy, 5), 0, 1);
+  for (let i = 0; i < 3; i++) {
+    const Fex = Math.exp(-(betaR[i] * sR + betaM[i] * sM));
+    const ratio = (betaR[i] * rPhase + betaM[i] * mPhase) / (betaR[i] + betaM[i]);
+    let Lin = Math.pow(sunE * ratio * (1 - Fex), 1.5);
+    Lin *= 1 + (Math.pow(sunE * ratio * Fex, 0.5) - 1) * mixk;
+    const L0 = 0.1 * Fex;
+    out[i] = (Lin + L0) * 0.04;
+  }
+  out[1] += 0.0003; out[2] += 0.00075;
+  return out;
+}
+
 const ENV_I = 0.8;
 // ------------------------------------------------------------------ Atmosphere
 export class Atmosphere {
@@ -120,12 +157,9 @@ export class Atmosphere {
     this.fogBase = 0.0006;
     this.fogMul = 1;
 
-    // 雾色探针
-    this.probeRT = new THREE.WebGLRenderTarget(4, 4, { type: THREE.FloatType });
-    this.probeCam = new THREE.PerspectiveCamera(20, 1, 0.1, 100);
-    this.probeBuf = new Float32Array(4 * 4 * 4);
     this.fogAway = new THREE.Color();
     this.fogToward = new THREE.Color();
+    this._gray = new THREE.Color();
 
     this.setHour(16, true);
   }
@@ -183,10 +217,12 @@ export class Atmosphere {
   }
 
   refreshEnv(force) {
+    // 雾色用 CPU 直接算(无 GPU 回读,不会卡顿),每次 setHour 都更新
+    this.sampleFog();
+    this.scene.fog.color.copy(this.fogAway);
+    SHARED.uFogSunCol.value.copy(this.fogToward);
     if (!force && Math.abs(this.hour - this.lastEnvHour) < 0.02) return;
     this.lastEnvHour = this.hour;
-    // 先探针取雾色(此时 envGround 颜色用占位)
-    this.sampleFog();
     // 地面反射 ≈ 雾色(暖化) * 反照率
     const g = this.fogAway;
     this.envGround.material.color.setRGB(g.r * 0.85 + 0.01, g.g * 0.7 + 0.008, g.b * 0.5 + 0.006);
@@ -194,38 +230,28 @@ export class Atmosphere {
     this.envRT = this.pmrem.fromScene(this.envScene, 0, 0.1, 1000);
     this.scene.environment = this.envRT.texture;
     this.scene.environmentIntensity = ENV_I;
-    this.scene.fog.color.copy(this.fogAway);
-    SHARED.uFogSunCol.value.copy(this.fogToward);
-    // 极暗时背景雾也要暗
   }
 
   sampleFog() {
-    const r = this.renderer;
-    const old = r.getRenderTarget();
-    const cam = this.probeCam;
-    const probe = (azOffset, elevDeg, color) => {
-      const az = this.sun.az + azOffset;
-      const el = (elevDeg * Math.PI) / 180;
-      cam.position.set(0, 0, 0);
-      cam.lookAt(Math.cos(el) * Math.sin(az), Math.sin(el), -Math.cos(el) * Math.cos(az));
-      cam.updateMatrixWorld();
-      r.setRenderTarget(this.probeRT);
-      r.render(this.envScene, cam);
-      r.readRenderTargetPixels(this.probeRT, 0, 0, 4, 4, this.probeBuf);
+    const u = this.envSky.material.uniforms;
+    const p = { turbidity: u.turbidity.value, rayleigh: u.rayleigh.value, mie: u.mieCoefficient.value, g: u.mieDirectionalG.value };
+    const sun = u.sunPosition.value;
+    const tmp = [0, 0, 0];
+    const avg = (azOffset, elevs, color) => {
       let R = 0, G = 0, B = 0;
-      for (let i = 0; i < 16; i++) { R += this.probeBuf[i * 4]; G += this.probeBuf[i * 4 + 1]; B += this.probeBuf[i * 4 + 2]; }
-      color.setRGB(R / 16, G / 16, B / 16);
+      const az = this.sun.az + azOffset;
+      for (const e of elevs) {
+        const el = (e * Math.PI) / 180;
+        skyRadiance(Math.cos(el) * Math.sin(az), Math.sin(el), -Math.cos(el) * Math.cos(az), sun, p, tmp);
+        R += tmp[0]; G += tmp[1]; B += tmp[2];
+      }
+      color.setRGB(R / elevs.length, G / elevs.length, B / elevs.length);
     };
-    // 保证环境地面不会被探针看到
-    const gOld = this.envGround.visible;
-    this.envGround.visible = false;
-    probe(Math.PI, 4, this.fogAway);
-    probe(0.62, 7, this.fogToward);
-    this.envGround.visible = gOld;
-    r.setRenderTarget(old);
-    // 略微去饱和并提亮,使远景更"海雾"
+    avg(Math.PI, [1.5, 4, 8], this.fogAway);
+    avg(0.62, [3, 7, 12], this.fogToward);
+    // 略微去饱和,使远景更"海雾"
     const lumA = this.fogAway.r * 0.3 + this.fogAway.g * 0.59 + this.fogAway.b * 0.11;
-    this.fogAway.lerp(new THREE.Color(lumA, lumA, lumA), 0.15);
+    this.fogAway.lerp(this._gray.setRGB(lumA, lumA, lumA), 0.15);
     // 朝太阳一侧的雾色:限制相对亮度,避免日落时远山被过曝成白色
     const lumT = this.fogToward.r * 0.3 + this.fogToward.g * 0.59 + this.fogToward.b * 0.11;
     const lumB = Math.max(this.fogAway.r * 0.3 + this.fogAway.g * 0.59 + this.fogAway.b * 0.11, 1e-3);

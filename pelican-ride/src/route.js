@@ -257,8 +257,9 @@ export function terrainHeight(s, d, z, detail = true) {
     }
   } else {
     const t0 = Math.max(0, (ad - 7) / 260);
-    const t = t0 <= 1 ? t0 : 1 + 0.35 * Math.log(t0); // 远处缓慢饱和,形成山脉而非无限增高
-    const n1 = fbm(s * 0.0042, d * 0.0042, detail ? 4 : 2, 11);
+    const t = t0 <= 1 ? t0 : 1 + 0.3 * Math.log(t0); // 远处缓慢饱和,形成山脉而非无限增高
+    let n1 = fbm(s * 0.0042, d * 0.0042, detail || t0 < 1.5 ? 4 : 2, 11);
+    if (t0 > 1) n1 = lerp(n1, fbm(s * 0.0019, d * 0.0019, 2, 14), smoothstep(1, 2.4, t0)); // 远景改用更低频的起伏,避免尖刺
     h = z.e + z.rise * Math.pow(t, 1.25) * (0.5 + 1.0 * n1);
     if (detail) h += z.rough * (fbm(s * 0.03, d * 0.03, 3, 13) - 0.5) * 2 * smoothstep(0, 0.25, t);
   }

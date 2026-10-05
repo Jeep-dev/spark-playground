@@ -239,7 +239,7 @@ export class Landmarks {
     const B = LANDMARKS.bixby;
     const g = frame(this.scene, B.s);
     const e = getZone(B.s, zTmp).e;
-    const concrete = mat({ color: new THREE.Color(...hex(0xc4bfb1)), roughness: 0.92 });
+    const concrete = mat({ color: new THREE.Color(...hex(0xb3aa9a)), roughness: 0.92 });
     const concreteDark = mat({ color: new THREE.Color(...hex(0xa8a396)), roughness: 0.95 });
     const half = 58;
     const hs = Math.max(0, hAt(B.s - half, 0));
@@ -417,8 +417,8 @@ export class Landmarks {
     // 支架 (A 形)
     const stand = [];
     for (const sx of [-2.2, 2.2]) {
-      stand.push(tube(V(sx, deckY, -9), V(sx * 0.3, wy, -0.3), 0.3, 0.2, 6));
-      stand.push(tube(V(sx, deckY, 9), V(sx * 0.3, wy, 0.3), 0.3, 0.2, 6));
+      stand.push(tube(V(-wd + sx, deckY, -9), V(-wd + sx * 0.3, wy, -0.3), 0.3, 0.2, 6));
+      stand.push(tube(V(-wd + sx, deckY, 9), V(-wd + sx * 0.3, wy, 0.3), 0.3, 0.2, 6));
     }
     g.add(new THREE.Mesh(merge(stand), rimM));
     // 旋转木马与乐园建筑
