@@ -74,7 +74,7 @@ export class UI {
     $('btnShot').addEventListener('click', () => this.cb.screenshot());
     $('btnFull').addEventListener('click', () => {
       if (document.fullscreenElement) document.exitFullscreen();
-      else document.documentElement.requestFullscreen?.();
+      else document.documentElement.requestFullscreen?.()?.catch?.(() => this.toast('此环境不支持全屏'));
     });
     $('btnHide').addEventListener('click', () => this.toggleHide());
     // 点击画布空白处收起面板

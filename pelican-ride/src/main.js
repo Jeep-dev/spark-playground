@@ -153,7 +153,11 @@ const ui = new UI({
 cams.onChange = (id) => ui.setCamera(id);
 ui.setCamera('chase');
 
+const embedded = window.self !== window.top;
+if (embedded) { const b = $('btnShot'); if (b) b.hidden = true; }
+
 function screenshot() {
+  if (embedded) { ui.toast('嵌入页面中无法下载截图'); return; }
   composer.render();
   canvas.toBlob((b) => {
     const a = document.createElement('a');
